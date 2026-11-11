@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import io
 import json
+import os
+import tempfile
 import time
 import unittest
 import urllib.error
@@ -479,6 +481,147 @@ class TestModelEffort(unittest.TestCase):
         self.assertIn("Effort set: high", text)
         self.assertIn("Invalid effort", text)
 
+
+class TestSessions(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.store = nada.SessionStore(os.path.join(self._tmp.name, "sessions"))
+        patcher = patch.object(nada, "PERMS", perms("default"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        nada.set_effort(None)
+        self.addCleanup(lambda: nada.set_effort(None))
+
+    def _session(self, first="do the thing"):
+        s = nada.Session(self.store)
+        s.messages.append({"role": "user", "content": first})
+        s.messages.append({"role": "assistant", "content": "done"})
+        s.history.append(first)
+        return s
+
+    def test_sanitize_rejects_paths(self):
+        for bad in ["../x", "a/b", "a\\b", "", ".hidden", "a.json", "a b", ".."]:
+            with self.assertRaises(ValueError, msg=bad):
+                nada.sanitize_session_id(bad)
+        self.assertEqual(nada.sanitize_session_id("20260101-120000-abcd1234"), "20260101-120000-abcd1234")
+
+    def test_validate_rejects_bad_data(self):
+        good = {"version": 1, "id": "abc123",
+                "messages": [{"role": "user", "content": "hi"}]}
+        self.assertEqual(nada._validate_session_data(good)["id"], "abc123")
+        for bad in [{**good, "version": 999}, {**good, "messages": []},
+                    {**good, "messages": [{"content": "x"}]},
+                    {**good, "allowlist": [["bash"]]}, {**good, "history": [1]}]:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                nada._validate_session_data(bad)
+
+    def test_trim_and_title(self):
+        msgs = [{"role": "system", "content": "s"},
+                {"role": "user", "content": "  fix   the\nbug  "},
+                {"role": "assistant", "content": "", "tool_calls": [{"id": "1", "function": {}}]}]
+        self.assertEqual(nada._derive_title(msgs), "fix the")
+        self.assertEqual(len(nada._trim_incomplete_tool_calls(msgs)), 2)  # dangling call dropped
+        complete = msgs + [{"role": "tool", "tool_call_id": "1", "content": "ok"}]
+        self.assertEqual(len(nada._trim_incomplete_tool_calls(complete)), 4)
+
+    def test_default_session_dir_env(self):
+        with patch.dict(os.environ, {"AGENT_SESSION_DIR": "/tmp/my-sessions"}):
+            self.assertEqual(str(nada.default_session_dir()), "/tmp/my-sessions")
+
+    def test_roundtrip_preserves_tool_calls(self):
+        s = self._session()
+        s.messages[-1] = {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]}
+        s.messages.append({"role": "tool", "tool_call_id": "1", "content": "ran"})
+        s.messages.append({"role": "assistant", "content": "done"})
+        path = s.save()
+        self.assertTrue(path.is_file())
+        self.assertEqual(os.listdir(self._tmp.name + "/sessions"), [f"{s.id}.json"])  # no tmp left
+        loaded = self.store.load(s.id)
+        self.assertEqual(loaded["messages"], s.messages)
+        self.assertEqual(loaded["history"], [s.history[0]])
+        self.assertEqual(loaded["title"], "do the thing")
+
+    def test_list_latest_delete_and_corrupt_skipped(self):
+        s1, s2 = self._session("first"), self._session("second")
+        s1.save(); s2.save()
+        summaries = self.store.list()
+        self.assertEqual([x["id"] for x in summaries], [s2.id, s1.id])  # newest first
+        self.assertEqual(self.store.load("latest")["id"], s2.id)
+        with open(os.path.join(self._tmp.name, "sessions", "bad.json"), "w") as f:
+            f.write("not json")
+        self.assertEqual(len(self.store.list()), 2)  # corrupt file skipped
+        self.assertTrue(self.store.delete(s1.id))
+        self.assertFalse(self.store.delete(s1.id))
+        with self.assertRaises(FileNotFoundError):
+            self.store.load(s1.id)
+
+    def test_try_save_only_with_a_turn(self):
+        s = nada.Session(self.store)
+        self.assertFalse(s.try_save())  # nothing to save yet
+        self.assertFalse(self.store.dir.exists())
+        s.messages.append({"role": "user", "content": "hi"})
+        self.assertTrue(s.try_save())
+        s.autosave = False
+        self.assertFalse(s.try_save())
+
+    def test_restore_keeps_current_permissions(self):
+        nada.PERMS.set_mode("accept-edits")
+        nada.PERMS.allowlist.add(("bash", "make build"))
+        nada.set_effort("high")
+        s = self._session()
+        data = s.snapshot()
+        self.assertEqual(data["permission_mode"], "accept-edits")  # recorded...
+        self.assertEqual(data["allowlist"], [["bash", "make build"]])
+        s.save()
+        # Change live state, then restore: messages/effort come back,
+        # but a file must not silently escalate permissions.
+        nada.PERMS.set_mode("plan")
+        nada.PERMS.allowlist.clear()
+        nada.set_effort("low")
+        restored = nada.Session(self.store)
+        with patch("sys.stdout", io.StringIO()):
+            restored.restore(self.store.load(s.id))
+        self.assertEqual(restored.messages[1:], s.messages[1:])
+        self.assertEqual(restored.messages[0]["content"], nada.SYSTEM)  # regenerated
+        self.assertEqual(restored.history, s.history)
+        self.assertEqual(nada.EFFORT, "high")
+        self.assertEqual(nada.PERMS.mode, "plan")       # ...not restored
+        self.assertEqual(nada.PERMS.allowlist, set())    # ...not restored
+
+    def test_session_command(self):
+        s = self._session()
+        s.save()
+        other = nada.Session(self.store)
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            nada.handle_session_command(["/session", "list"], other)
+            nada.handle_session_command(["/resume", s.id], other)
+            nada.handle_session_command(["/session"], other)
+            nada.handle_session_command(["/session", "resume", "missing"], other)
+        self.assertEqual(other.turns, 1)  # resumed before the delete below
+        with patch("sys.stdout", out):
+            nada.handle_session_command(["/session", "delete", s.id], other)
+        text = out.getvalue()
+        self.assertIn(s.id, text)
+        self.assertIn("Resumed session", text)
+        self.assertIn("Session not found: missing", text)
+        self.assertIn("Deleted session", text)
+        self.assertNotEqual(other.id, s.id)  # deleting the live session starts a new one
+        self.assertEqual(self.store.list(), [])
+
+    def test_parse_args_sessions(self):
+        a = nada.parse_args(["--session", "abc123", "do it"])
+        self.assertEqual(a.session, "abc123")
+        self.assertEqual(a.task, ["do it"])
+        a = nada.parse_args(["--continue"])
+        self.assertTrue(a.continue_session)
+        a = nada.parse_args(["--session-dir", "/tmp/s", "--no-autosave"])
+        self.assertEqual(a.session_dir, "/tmp/s")
+        self.assertTrue(a.no_autosave)
+        with self.assertRaises(SystemExit):  # mutually exclusive
+            nada.parse_args(["--session", "abc", "--continue"])
 
 class TestParseArgs(unittest.TestCase):
     def test_task_and_flags(self):

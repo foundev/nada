@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json, os, random, select, shlex, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+import argparse, json, os, random, re, select, shlex, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -624,6 +624,16 @@ def parse_args(argv=None):
                    help="auto-approve file edits; shell commands still prompt")
     p.add_argument("--plan", action="store_true",
                    help="read-only mode: deny edits and non-read-only shell commands")
+    session_group = p.add_mutually_exclusive_group()
+    session_group.add_argument("--session", dest="session", metavar="ID", default=None,
+                               help="resume the saved session ID (or 'latest') instead of "
+                                    "starting a new one; unknown IDs are an error")
+    session_group.add_argument("--continue", dest="continue_session", action="store_true",
+                               help="resume the most recently saved session")
+    p.add_argument("--session-dir", dest="session_dir", metavar="DIR", default=None,
+                   help="directory for saved sessions (default: $AGENT_SESSION_DIR or ~/.nada/sessions)")
+    p.add_argument("--no-autosave", dest="no_autosave", action="store_true",
+                   help="do not auto-save the session after each turn (REPL /session save still works)")
     p.add_argument("task", nargs="*", help="task to run non-interactively; omit for the REPL")
     return p.parse_args(argv)
 
@@ -813,6 +823,327 @@ def handle_effort_command(parts):
         return
     print(f"Effort set: {level} for {MODEL}")
 
+# --- Sessions --------------------------------------------------------------
+# A session is the persisted conversation state: messages (stored verbatim,
+# so tool_calls survive a restart), REPL history, and the permission
+# mode/allowlist and effort in force. One JSON file per session under
+# ~/.nada/sessions (override with --session-dir / AGENT_SESSION_DIR).
+# Sessions are autosaved after every REPL turn and after one-shot runs,
+# so quitting and re-running with --session ID / --continue resumes where
+# you left off; `/session save` forces a save (e.g. with --no-autosave).
+
+SESSION_VERSION = 1
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+_SESSION_USAGE = ("Usage: /session [save [TITLE]|list|resume ID|new|delete ID|path]  "
+                  "(aliases: /sessions, /resume ID)")
+
+def default_session_dir():
+    """Directory saved sessions live in: $AGENT_SESSION_DIR (alias
+    $NADA_SESSION_DIR) or ~/.nada/sessions."""
+    env = os.environ.get("AGENT_SESSION_DIR") or os.environ.get("NADA_SESSION_DIR")
+    if env:
+        return Path(env).expanduser()
+    try:
+        return Path.home() / ".nada" / "sessions"
+    except Exception:
+        return Path.cwd() / ".nada" / "sessions"
+
+def _new_session_id():
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+
+def sanitize_session_id(session_id):
+    """A session id is a plain file stem; anything else (paths, `..`,
+    separators) is rejected so ids can never escape the session dir."""
+    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+        raise ValueError(f"invalid session id: {session_id!r}")
+    return session_id
+
+def _utcnow():
+    return datetime.now(timezone.utc).isoformat()
+
+def _derive_title(messages):
+    """Title from the first user message, or 'untitled session'."""
+    for m in messages:
+        if m.get("role") == "user" and isinstance(m.get("content"), str) and m["content"].strip():
+            return " ".join(m["content"].strip().splitlines()[0].split())[:60]
+    return "untitled session"
+
+def _count_turns(messages):
+    return sum(1 for m in messages if m.get("role") == "user")
+
+def _trim_incomplete_tool_calls(messages):
+    """Longest prefix with no dangling tool_calls: an assistant message
+    whose tool results never arrived (interrupted mid-turn) would make the
+    next API call fail, so it is dropped along with anything after it."""
+    pending, last_clean = set(), 0
+    for idx, m in enumerate(messages):
+        if m.get("role") == "assistant":
+            for call in m.get("tool_calls") or []:
+                if isinstance(call, dict) and call.get("id"):
+                    pending.add(call["id"])
+        elif m.get("role") == "tool":
+            pending.discard(m.get("tool_call_id"))
+        if not pending:
+            last_clean = idx + 1
+    return [dict(m) for m in messages[:last_clean]]
+
+def _validate_session_data(data):
+    """Normalized session dict, or ValueError if the data is not a
+    well-formed session of the current version."""
+    if not isinstance(data, dict):
+        raise ValueError("session file must contain a JSON object")
+    if data.get("version") != SESSION_VERSION:
+        raise ValueError(f"unsupported session version: {data.get('version')!r}")
+    sid = sanitize_session_id(data.get("id"))
+    messages = data.get("messages")
+    if (not isinstance(messages, list) or not messages or
+            any(not isinstance(m, dict) or not m.get("role") for m in messages)):
+        raise ValueError("session has no valid messages")
+    history = data.get("history") or []
+    if not isinstance(history, list) or any(not isinstance(h, str) for h in history):
+        raise ValueError("session history must be a list of strings")
+    allowlist = data.get("allowlist") or []
+    if (not isinstance(allowlist, list) or
+            any(not (isinstance(e, (list, tuple)) and len(e) == 2 and
+                     all(isinstance(x, str) for x in e)) for e in allowlist)):
+        raise ValueError("session allowlist must be [tool, pattern] pairs")
+    out = dict(data)
+    out.update({"id": sid, "messages": [dict(m) for m in messages],
+                "history": list(history),
+                "allowlist": [[name, pattern] for name, pattern in allowlist]})
+    return out
+
+def session_summary(data):
+    return {"id": data["id"], "title": data.get("title") or "untitled session",
+            "updated_at": data.get("updated_at") or "",
+            "turns": _count_turns(data.get("messages") or []),
+            "messages": len(data.get("messages") or [])}
+
+class SessionStore:
+    """JSON-file storage for sessions: one `<id>.json` per session."""
+
+    def __init__(self, directory=None):
+        self.dir = Path(directory).expanduser() if directory else default_session_dir()
+
+    def path_for(self, session_id):
+        return self.dir / f"{sanitize_session_id(session_id)}.json"
+
+    def save(self, data):
+        """Validate and atomically write a session; returns (path, saved data)."""
+        data = _validate_session_data(data)
+        data["updated_at"] = _utcnow()
+        self.dir.mkdir(parents=True, exist_ok=True)
+        path = self.path_for(data["id"])
+        tmp = self.dir / f".{data['id']}.json.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        try:
+            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            os.replace(tmp, path)  # atomic: a crash never leaves a half-written session
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except TypeError:  # older Pythons: unlink() has no missing_ok
+                if tmp.exists():
+                    tmp.unlink()
+        return path, data
+
+    def _load_file(self, path):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            raise ValueError(f"corrupt session {path.name}: {e}") from e
+        return _validate_session_data(data)
+
+    def load(self, session_id):
+        """Load a session by id ('latest' = most recently updated)."""
+        if session_id == "latest":
+            summaries = self.list()
+            if not summaries:
+                raise FileNotFoundError("no saved sessions")
+            session_id = summaries[0]["id"]
+        path = self.path_for(session_id)
+        if not path.is_file():
+            raise FileNotFoundError(f"session not found: {session_id}")
+        return self._load_file(path)
+
+    def list(self):
+        """Summaries of all saved sessions, most recently updated first.
+        Corrupt files are skipped with a warning, not fatal."""
+        if not self.dir.is_dir():
+            return []
+        summaries = []
+        for path in sorted(self.dir.glob("*.json")):
+            try:
+                summaries.append(session_summary(self._load_file(path)))
+            except Exception as e:
+                print(f"Warning: skipping {path.name}: {e}", file=sys.stderr)
+        summaries.sort(key=lambda s: s["updated_at"], reverse=True)
+        return summaries
+
+    def delete(self, session_id):
+        path = self.path_for(session_id)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        return True
+
+class Session:
+    """Live session: messages/history for run_turns() plus metadata to
+    persist/restore them. PERMS/EFFORT go through the module globals, so a
+    restored session brings back its mode, allowlist, and effort too."""
+
+    def __init__(self, store, *, session_id=None, title=None, messages=None, history=None):
+        self.store = store
+        self.id = sanitize_session_id(session_id) if session_id else _new_session_id()
+        self.title = title
+        self.created_at = self.updated_at = _utcnow()
+        self.root, self.model = str(ROOT), MODEL
+        self.messages = messages if messages is not None else [{"role": "system", "content": SYSTEM}]
+        self.history = history if history is not None else []
+        self.autosave = True
+
+    @property
+    def turns(self):
+        return _count_turns(self.messages)
+
+    def path(self):
+        return self.store.path_for(self.id)
+
+    def snapshot(self):
+        """Persistable form of the current state (dangling tool_calls trimmed)."""
+        return {"version": SESSION_VERSION, "id": self.id,
+                "title": self.title or _derive_title(self.messages),
+                "created_at": self.created_at, "updated_at": self.updated_at,
+                "root": self.root, "model": self.model, "effort": EFFORT,
+                "permission_mode": PERMS.mode,
+                "allowlist": sorted([list(item) for item in PERMS.allowlist]),
+                "history": list(self.history),
+                "messages": _trim_incomplete_tool_calls(self.messages)}
+
+    def save(self):
+        """Save now (even with autosave off); returns the file path."""
+        path, data = self.store.save(self.snapshot())
+        self.title, self.updated_at = data["title"], data["updated_at"]
+        return path
+
+    def try_save(self):
+        """Best-effort autosave: only once there is a turn to save, and a
+        failure warns instead of crashing the REPL."""
+        if not self.autosave or not self.turns:
+            return False
+        try:
+            self.save()
+        except Exception as e:
+            print(f"Warning: could not save session {self.id} ({e})", file=sys.stderr)
+            return False
+        return True
+
+    def restore(self, data, *, apply_effort=True, supported_efforts=None):
+        """Replace messages/history/effort with a saved session's. The
+        system prompt is regenerated for the current ROOT; a different
+        originating root is reported, not fatal. Permission mode and
+        allowlist are not restored (see below)."""
+        data = _validate_session_data(data)
+        self.id, self.title = data["id"], data.get("title")
+        self.created_at = data.get("created_at") or _utcnow()
+        self.updated_at = data.get("updated_at") or self.created_at
+        self.root, self.model = data.get("root") or str(ROOT), data.get("model") or MODEL
+        messages = [dict(m) for m in data["messages"]]
+        if messages and messages[0].get("role") == "system":
+            messages[0] = {"role": "system", "content": SYSTEM}
+        else:
+            messages.insert(0, {"role": "system", "content": SYSTEM})
+        self.messages[:] = _trim_incomplete_tool_calls(messages)
+        self.history[:] = list(data.get("history") or [])
+        # Permission mode/allowlist are recorded in the file but deliberately
+        # not restored: loading a file must not silently escalate permissions.
+        if data.get("permission_mode") and data["permission_mode"] != PERMS.mode:
+            print(f"Note: session was saved with permission mode {data['permission_mode']} "
+                  f"(current: {PERMS.mode}; not restored -- use /mode to change)")
+        if apply_effort and "effort" in data:
+            try:
+                set_effort(data.get("effort"), supported_efforts)
+            except ValueError as e:
+                print(f"Warning: saved effort {data.get('effort')!r} not applied ({e})")
+        if data.get("root") and data["root"] != str(ROOT):
+            print(f"Note: session was created in {data['root']}; current root is {ROOT}")
+        return self
+
+    def reset(self):
+        """Start a new, empty session (new id, fresh history)."""
+        self.id, self.title = _new_session_id(), None
+        self.created_at = self.updated_at = _utcnow()
+        self.messages[:] = [{"role": "system", "content": SYSTEM}]
+        self.history[:] = []
+
+def handle_session_command(parts, session):
+    """Handle `/session ...` (and the `/sessions` / `/resume ID` aliases)."""
+    cmd, rest = parts[0], parts[1:]
+    if cmd == "/sessions":
+        rest = ["list"]
+    elif cmd == "/resume":
+        rest = ["resume"] + rest
+    if not rest:
+        print(f"Session: {session.id}")
+        print(f"Title: {session.title or _derive_title(session.messages)}")
+        print(f"Turns: {session.turns}  Messages: {len(session.messages)}")
+        print(f"Saved to: {session.path()}")
+        print(_SESSION_USAGE)
+        return
+    sub, args = rest[0], rest[1:]
+    if sub in {"list", "ls"}:
+        summaries = session.store.list()
+        if not summaries:
+            print("No saved sessions")
+        for s in summaries:
+            print(f"{s['id']}  {s['updated_at']}  turns={s['turns']}  {s['title']}")
+    elif sub == "save":
+        if args:
+            session.title = " ".join(args)
+        try:
+            path = session.save()
+        except Exception as e:
+            print(f"Could not save session: {e}")
+        else:
+            print(f"Session saved: {session.id} ({path})")
+    elif sub == "new":
+        session.reset()
+        print(f"New session: {session.id}")
+    elif sub == "path":
+        print(session.path())
+    elif sub in {"resume", "load", "continue"}:
+        target = args[0] if args else ("latest" if sub == "continue" else None)
+        if target is None:
+            print(_SESSION_USAGE)
+            return
+        try:
+            data = session.store.load(target)
+        except FileNotFoundError:
+            print(f"Session not found: {target}")
+        except Exception as e:
+            print(f"Could not resume session {target}: {e}")
+        else:
+            session.restore(data)
+            print(f"Resumed session: {session.id} ({session.turns} turns)")
+    elif sub == "delete":
+        if not args:
+            print(_SESSION_USAGE)
+            return
+        try:
+            deleted = session.store.delete(args[0])
+        except ValueError as e:
+            print(f"Could not delete session: {e}")
+            return
+        if not deleted:
+            print(f"Session not found: {args[0]}")
+            return
+        print(f"Deleted session: {args[0]}")
+        if args[0] == session.id:  # don't let autosave resurrect the live session
+            session.reset()
+            print(f"New session: {session.id}")
+    else:
+        print(_SESSION_USAGE)
+
 def main():
     args = parse_args()
     if _PERM_ERROR and not (args.yes or args.permission_mode or args.accept_edits or args.plan):
@@ -844,31 +1175,54 @@ def main():
             validate_effort(EFFORT, _reasoning["supported_efforts"] if _reasoning else None)
         except ValueError as e:
             sys.exit(f"error: {e}")
-    messages = [{"role": "system", "content": SYSTEM}]
+    store = SessionStore(args.session_dir)
+    session = Session(store)
+    session.autosave = not args.no_autosave
+    if args.session or args.continue_session:
+        target = args.session or "latest"
+        try:
+            data = store.load(target)
+        except FileNotFoundError:
+            sys.exit(f"error: session not found: {target} (dir: {store.dir})")
+        except Exception as e:
+            sys.exit(f"error: could not load session {target}: {e}")
+        session.restore(data, apply_effort=args.effort is None,
+                        supported_efforts=_reasoning["supported_efforts"] if _reasoning else None)
+        print(f"Resumed session: {session.id} ({session.turns} turns)")
     if args.task:
-        messages.append({"role": "user", "content": " ".join(args.task)}); run_turns(messages); return
+        session.messages.append({"role": "user", "content": " ".join(args.task)})
+        try:
+            run_turns(session.messages)
+        finally:
+            session.try_save()
+        return
     print(f"Model: {MODEL}\n{_effort_summary(_reasoning)}\nRoot: {ROOT}\nPermissions: {PERMS.mode} ({PERMS.describe()})")
+    print(f"Session: {session.id} ({session.path()})")
     print("/quit to exit, /clear to reset, /mode [default|accept-edits|plan|auto|yolo] to switch modes, "
-          "/effort [LEVEL|clear] to set model effort")
+          "/effort [LEVEL|clear] to set model effort, "
+          "/session [save|list|resume ID|new] to manage sessions")
     print("Ctrl+Tab / Shift+Tab at the prompt cycles modes; /permissions shows the session allowlist")
-    history = []
     while True:
         print()
-        try: task = read_repl_line(PERMS, history).strip()
+        try: task = read_repl_line(PERMS, session.history).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
         if task in {"/quit", "/exit"}: break
-        if task == "/clear": messages = [{"role": "system", "content": SYSTEM}]; continue
+        if task == "/clear": session.messages[:] = [{"role": "system", "content": SYSTEM}]; continue
         if task.split() and task.split()[0] in {"/permissions", "/mode"}:
             handle_permissions_command(task.split()); continue
         if task.split() and task.split()[0] == "/effort":
             handle_effort_command(task.split()); continue
+        if task.split() and task.split()[0] in {"/session", "/sessions", "/resume"}:
+            handle_session_command(task.split(), session); continue
         if task:
-            history.append(task)
-            messages.append({"role": "user", "content": task})
-            try: run_turns(messages)
+            session.history.append(task)
+            session.messages.append({"role": "user", "content": task})
+            try: run_turns(session.messages)
             except Exception as e: print(f"Error: {e}")
+            finally: session.try_save()
+    session.try_save()
 
 if __name__ == "__main__":
     main()

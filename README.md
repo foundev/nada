@@ -14,7 +14,8 @@ python3 nada.py --help
 ```
 
 REPL commands: `/quit`, `/clear`, `/mode [MODE]`, `/permissions [MODE|clear]`,
-`/effort [LEVEL|clear]`.
+`/effort [LEVEL|clear]`, `/session [save [TITLE]|list|resume ID|new|delete ID|path]`
+(aliases: `/sessions`, `/resume ID`).
 
 ## Permissions
 
@@ -139,6 +140,42 @@ shows the levels available for the current model, and `/effort clear` (or
 `none`, `x-high`/`extra-high` → `xhigh`. An invalid level for the model exits
 with an error listing the available ones.
 
+## Sessions
+
+Conversations are persisted as sessions and survive quitting. A session is
+one JSON file (`<id>.json`) under `~/.nada/sessions` (override with
+`--session-dir DIR` or `AGENT_SESSION_DIR`), storing the messages verbatim
+(so `tool_calls` resume correctly), the REPL history, and the model, effort,
+and permission mode in force. The title is derived from the first user
+message unless you name the session with `/session save TITLE`. Writes are
+atomic (temp file + rename), and a session interrupted mid-turn is trimmed
+back to the last complete tool call, so resuming never sends the API a
+dangling `tool_calls` message.
+
+Sessions are **autosaved** after every REPL turn and after one-shot runs
+(`--no-autosave` disables this; `/session save` still works), and once more
+on exit. A session with no turns yet is never written.
+
+```sh
+python3 nada.py                     # new session (id shown at startup)
+python3 nada.py --continue          # resume the most recently saved session
+python3 nada.py --session ID        # resume a specific session ('latest' also works)
+python3 nada.py --session ID "follow-up task"   # resume + one-shot task, then save
+```
+
+In the REPL: `/session` shows the current session, `/session list` lists
+saved sessions (newest first), `/session resume ID` (or `/resume ID`) loads
+one, `/session new` starts a fresh one, and `/session delete ID` removes
+one (deleting the live session starts a new one, so autosave can't
+resurrect it). Resuming regenerates the system prompt for the current
+working directory and reports it if the session was created elsewhere;
+the saved effort is restored (unless `--effort` was given), but the
+permission mode and session allowlist are deliberately **not** restored —
+loading a file must not silently escalate permissions, so re-apply them
+with `/mode` / the usual prompts. Session ids are simple file stems;
+anything else (`..`, `/`) is rejected, unknown ids are an error, and
+corrupt session files are skipped with a warning when listing.
+
 ## Environment variables
 
 | Variable | Default | Meaning |
@@ -148,6 +185,7 @@ with an error listing the available ones.
 | `AGENT_REVIEW_MODEL` | `openai/gpt-6-luna` | reviewer model id for `auto` mode |
 | `AGENT_PERMISSION_MODE` | `default` | `default`\|`accept-edits`\|`plan`\|`auto`\|`yolo` (aliases: `ask`, `deny`, `approve-for-me`, …) |
 | `AGENT_EFFORT` | model default | reasoning effort level for `MODEL`, discovered per model (see above; aliases `MODEL_EFFORT`, `REASONING_EFFORT`, `EFFORT`) |
+| `AGENT_SESSION_DIR` | `~/.nada/sessions` | directory for saved sessions (alias `NADA_SESSION_DIR`; `--session-dir` overrides) |
 | `AGENT_MAX_TURNS` | `2000000` | max tool-calling turns per task |
 | `AGENT_MAX_RETRIES` | `5` | retries on HTTP 429 (rate limit) before giving up |
 | `AGENT_RETRY_BASE_DELAY` | `1` | seconds; first 429 wait (doubled every retry) |
