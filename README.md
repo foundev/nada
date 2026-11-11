@@ -59,8 +59,8 @@ weakening, and destructive/irreversible actions; approve ordinary reversible
 in-workspace work. Reviewer errors and unparsable verdicts **fail closed**
 (deny). This costs one extra model call per gated action.
 
-The reviewer uses `AGENT_REVIEW_MODEL` (fallback `MODEL`); e.g.
-`AGENT_REVIEW_MODEL=openai/gpt-5.6-luna` for a Luna reviewer, if available on
+The reviewer uses `AGENT_REVIEW_MODEL` (default `openai/gpt-6-luna`); e.g.
+`AGENT_REVIEW_MODEL=openai/gpt-5.6-luna` to override it, if available on
 OpenRouter. `yolo` is the old behaviour of `auto`: no prompt, no review.
 
 ### Switching modes with Ctrl+Tab
@@ -145,7 +145,7 @@ with an error listing the available ones.
 |----------|---------|---------|
 | `OPENROUTER_API_KEY` | — | required |
 | `MODEL` | `meta/muse-ember` | model id |
-| `AGENT_REVIEW_MODEL` | `MODEL` | reviewer model id for `auto` mode (e.g. a Luna model) |
+| `AGENT_REVIEW_MODEL` | `openai/gpt-6-luna` | reviewer model id for `auto` mode |
 | `AGENT_PERMISSION_MODE` | `default` | `default`\|`accept-edits`\|`plan`\|`auto`\|`yolo` (aliases: `ask`, `deny`, `approve-for-me`, …) |
 | `AGENT_EFFORT` | model default | reasoning effort level for `MODEL`, discovered per model (see above; aliases `MODEL_EFFORT`, `REASONING_EFFORT`, `EFFORT`) |
 | `AGENT_MAX_TURNS` | `2000000` | max tool-calling turns per task |

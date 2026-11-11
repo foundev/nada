@@ -11,9 +11,9 @@ except ImportError:  # non-Unix: REPL falls back to plain input()
 
 ROOT = Path.cwd().resolve()
 MODEL = os.environ.get("MODEL", "meta/muse-ember")
-# Reviewer for `auto` (approve-for-me) mode; defaults to the main model.
-# Set e.g. AGENT_REVIEW_MODEL=openai/gpt-5.6-luna (if available on OpenRouter).
-REVIEW_MODEL = os.environ.get("AGENT_REVIEW_MODEL") or os.environ.get("REVIEW_MODEL") or MODEL
+# Reviewer for `auto` (approve-for-me) mode; defaults to openai/gpt-6-luna.
+# Override e.g. AGENT_REVIEW_MODEL=openai/gpt-5.6-luna (if available on OpenRouter).
+REVIEW_MODEL = os.environ.get("AGENT_REVIEW_MODEL") or os.environ.get("REVIEW_MODEL") or "openai/gpt-6-luna"
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "2000000"))
 # 429 (rate limit) retries in call_model: exponential backoff between tries.
