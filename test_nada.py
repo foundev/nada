@@ -803,6 +803,215 @@ class TestParseArgs(unittest.TestCase):
         self.assertEqual(a.effort, "low")
 
 
+class TestTerminalUI(unittest.TestCase):
+    """Codex-style TUI: boxed banner, spinner, collapsed ✓/✗ tool lines,
+    diff approvals, token footer, /help /status /verbose, tty-only colour."""
+
+    class _Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    def test_use_color_only_on_tty_and_never_with_no_color(self):
+        self.assertTrue(nada._use_color(self._Tty()))
+        self.assertFalse(nada._use_color(io.StringIO()))
+        with patch.dict(os.environ, {"NO_COLOR": "1"}):
+            self.assertFalse(nada._use_color(self._Tty()))
+        with patch.dict(os.environ, {"TERM": "dumb"}):
+            self.assertFalse(nada._use_color(self._Tty()))
+
+    def test_style_and_strip_ansi(self):
+        with patch.object(nada, "_use_color", lambda stream=None: True):
+            self.assertEqual(nada._style("x", "1"), "\x1b[1mx\x1b[0m")
+        with patch.object(nada, "_use_color", lambda stream=None: False):
+            self.assertEqual(nada._style("x", "1"), "x")
+        self.assertEqual(nada._strip_ansi("\x1b[32mhi\x1b[0m"), "hi")
+
+    def test_format_duration(self):
+        self.assertEqual(nada.format_duration(0), "0ms")
+        self.assertEqual(nada.format_duration(0.04), "40ms")
+        self.assertEqual(nada.format_duration(1.0), "1s")
+        self.assertEqual(nada.format_duration(1.5), "1.5s")
+        self.assertEqual(nada.format_duration(65), "1m 5s")
+
+    def test_tool_summary(self):
+        self.assertEqual(nada.tool_summary("bash", {"command": "ls -R"}), "Ran ls -R")
+        self.assertEqual(nada.tool_summary("bash", {"command": "ls -R"}, running=True),
+                         "Running ls -R")
+        self.assertEqual(nada.tool_summary("read_file", {"path": "nada.py"}), "Read nada.py")
+        self.assertEqual(nada.tool_summary("write_file", {"path": "x.py"}), "Wrote x.py")
+        self.assertEqual(nada.tool_summary("edit_file", {"path": "x.py"}), "Edited x.py")
+        long_summary = nada.tool_summary("bash", {"command": "x " * 100})
+        self.assertTrue(long_summary.endswith("…"))
+        self.assertLessEqual(len(long_summary), 80)
+
+    def test_format_tool_result_collapses_bash_output(self):
+        result = "$ ls\n[exit 0]\n" + "\n".join(f"line{i}" for i in range(20))
+        out = nada.format_tool_result("bash", {"command": "ls"}, result, ok=True)
+        self.assertTrue(out.startswith("✓ Ran ls"))
+        self.assertIn("line0", out)
+        self.assertIn("line11", out)       # TOOL_OUTPUT_MAX_LINES shown
+        self.assertNotIn("line12", out)    # ... the rest collapsed
+        self.assertIn("8 more lines", out)
+        self.assertNotIn("$ ls", out)      # the `$ cmd` header is not repeated
+        verbose = nada.format_tool_result("bash", {"command": "ls"}, result,
+                                          ok=True, verbose=True)
+        self.assertIn("line19", verbose)
+        self.assertNotIn("more lines", verbose)
+
+    def test_format_tool_result_failed_and_read(self):
+        out = nada.format_tool_result("bash", {"command": "ls"},
+                                      "$ ls\n[exit 3]\nboom", ok=False)
+        self.assertIn("✗ Ran ls · exit 3", out)
+        self.assertIn("boom", out)
+        out = nada.format_tool_result("read_file", {"path": "x.py"},
+                                      "    1 | a\n    2 | b\n    3 | c", ok=True)
+        self.assertIn("✓ Read x.py · 3 lines", out)
+        self.assertNotIn("| a", out)  # file contents are not dumped
+        out = nada.format_tool_result("bash", {"command": "ls"}, "Error: boom", ok=False)
+        self.assertIn("✗ Ran ls", out)
+        self.assertIn("Error: boom", out)
+
+    def test_format_diff(self):
+        out = nada.format_diff("a\nb\nc", "a\nB\nc", "x.py")
+        self.assertIn("--- x.py", out)
+        self.assertIn("+++ x.py", out)
+        self.assertIn("-b", out)
+        self.assertIn("+B", out)
+        self.assertEqual(nada.format_diff("a", "a", "x.py"), "(no changes)")
+        big = nada.format_diff("\n".join(f"old{i}" for i in range(30)),
+                               "\n".join(f"new{i}" for i in range(30)),
+                               "x.py", max_lines=5)
+        self.assertIn("more diff lines", big)
+
+    def test_preview_is_command_or_diff(self):
+        self.assertEqual(nada._preview("bash", {"command": "rm -rf /"}), "$ rm -rf /")
+        out = nada._preview("edit_file", {"path": "x.py", "old_string": "old",
+                                          "new_string": "new"})
+        self.assertIn("-old", out)
+        self.assertIn("+new", out)
+        out = nada._preview("write_file", {"path": "brand_new_file_xyz.py",
+                                           "content": "hello\n"})
+        self.assertIn("+hello", out)
+
+    def test_repl_prompt_plain_off_tty_coloured_on_tty(self):
+        p = perms("plan")
+        self.assertEqual(nada._repl_prompt(p, stream=io.StringIO()), "[plan] > ")
+        with patch.object(nada, "_use_color", lambda stream=None: True):
+            coloured = nada._repl_prompt(p, stream=io.StringIO())
+        self.assertIn("\x1b[", coloured)
+        self.assertEqual(nada._strip_ansi(coloured), "[plan] > ")
+
+    def test_format_banner_is_a_box_of_the_given_width(self):
+        banner = nada.format_banner(model="m", root="/r", mode="auto", effort="high",
+                                    session_id="s1", session_path="/s/s1.json",
+                                    agents=["AGENTS.md"], width=60)
+        lines = banner.splitlines()
+        self.assertTrue(all(len(nada._strip_ansi(l)) == 60 for l in lines))
+        self.assertTrue(lines[0].startswith("╭─") and lines[0].endswith("╮"))
+        self.assertTrue(lines[-1].startswith("╰─") and lines[-1].endswith("╯"))
+        for needle in ["nada · m", "/r", "auto · effort: high",
+                       "session: s1", "AGENTS.md: AGENTS.md", "/help for commands"]:
+            self.assertIn(needle, banner)
+
+    def test_format_usage(self):
+        self.assertEqual(nada.format_usage({"prompt_tokens": 1234,
+                                            "completion_tokens": 567}),
+                         "tokens: 1,234 in · 567 out")
+        self.assertIsNone(nada.format_usage({}))
+        self.assertIsNone(nada.format_usage(None))
+
+    def test_spinner_is_a_noop_off_tty(self):
+        out = io.StringIO()
+        with nada.Spinner("Working", stream=out):
+            pass
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(nada.spinner_frame(0), nada.SPINNER_FRAMES[0])
+
+    def test_help_status_verbose_commands(self):
+        out = io.StringIO()
+        with patch("sys.stdout", out):
+            nada.handle_help_command(["/help"])
+        for needle in ["/status", "/verbose", "/mode", "/effort", "Ctrl+Tab"]:
+            self.assertIn(needle, out.getvalue())
+
+        out = io.StringIO()
+        reasoning = nada.parse_model_reasoning(
+            {"reasoning": {"supported_efforts": ["high"], "default_effort": "high"}})
+        with patch("sys.stdout", out):
+            nada.handle_status_command(
+                session=type("S", (), {"id": "s1", "turns": 3,
+                                       "path": lambda self=None: "/s/s1.json"})(),
+                reasoning=reasoning)
+        for needle in ["Model:", "Permissions:", "high", "Session: s1", "Turns: 3"]:
+            self.assertIn(needle, out.getvalue())
+
+        out = io.StringIO()
+        with patch.object(nada, "VERBOSE", False), patch("sys.stdout", out):
+            self.assertFalse(nada.handle_verbose_command(["/verbose"]))
+            self.assertTrue(nada.handle_verbose_command(["/verbose", "on"]))
+            self.assertTrue(nada.VERBOSE)
+            self.assertFalse(nada.handle_verbose_command(["/verbose", "off"]))
+        self.assertIn("Verbose output: off", out.getvalue())
+
+    def test_ask_accepts_numbered_answers(self):
+        self.assertTrue(perms("ask", ["1"]).check("bash", {"command": "make build"}))
+        p = perms("ask", ["2"])
+        self.assertTrue(p.check("bash", {"command": "make build"}))
+        self.assertIn(("bash", "make build"), p.allowlist)
+        self.assertFalse(perms("ask", ["3"]).check("bash", {"command": "make build"}))
+
+    def test_parse_args_no_color_and_verbose(self):
+        a = nada.parse_args(["--no-color", "--verbose", "do it"])
+        self.assertTrue(a.no_color)
+        self.assertTrue(a.verbose)
+        self.assertEqual(a.task, ["do it"])
+        a = nada.parse_args(["do it"])
+        self.assertFalse(a.no_color)
+        self.assertFalse(a.verbose)
+
+    def _run_turn(self, handler_result, *, p=None, usage=None, verbose=False):
+        responses = iter([
+            {"choices": [{"message": {"content": "", "tool_calls": [
+                {"id": "1", "function": {"name": "bash",
+                                         "arguments": '{"command": "make build"}'}}]}}],
+             **({"usage": usage} if usage else {})},
+            {"choices": [{"message": {"content": "done"}}]},
+        ])
+        out = io.StringIO()
+        with patch.object(nada, "call_model", lambda messages: next(responses)), \
+             patch.object(nada, "PERMS", p or perms("yolo")), \
+             patch.object(nada, "HANDLERS", {"bash": lambda a: handler_result}), \
+             patch.object(nada, "VERBOSE", verbose), \
+             patch("sys.stdout", out):
+            messages = [{"role": "system", "content": ""}]
+            nada.run_turns(messages)
+        return out.getvalue(), messages
+
+    def test_run_turns_collapsed_output_and_token_footer(self):
+        result = "$ ls\n[exit 0]\n" + "\n".join(f"line{i}" for i in range(20))
+        out, _ = self._run_turn(result, usage={"prompt_tokens": 10,
+                                               "completion_tokens": 5})
+        self.assertIn("✓ Ran make build", out)
+        self.assertIn("8 more lines", out)
+        self.assertIn("tokens: 10 in · 5 out", out)
+        self.assertIn("done", out)
+        self.assertNotIn('{"command"', out)  # no raw argument dump
+
+    def test_run_turns_denied_and_failed_tools(self):
+        out, _ = self._run_turn("unused", p=perms("ask", ["n"]))
+        self.assertIn("✗ Ran make build", out)
+        self.assertIn("PermissionDenied", out)
+        out, _ = self._run_turn("$ ls\n[exit 2]\nboom")
+        self.assertIn("✗ Ran make build · exit 2", out)
+        self.assertIn("boom", out)
+
+    def test_run_turns_verbose_shows_full_output(self):
+        result = "$ ls\n[exit 0]\n" + "\n".join(f"line{i}" for i in range(20))
+        out, _ = self._run_turn(result, verbose=True)
+        self.assertIn("line19", out)
+        self.assertNotIn("more lines", out)
+
+
 class TestAgentsMd(unittest.TestCase):
     """AGENTS.md per https://agents.md: root + nested, exact filename,
     plain Markdown, closest to the edited file wins, user chat overrides."""

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json, os, random, re, select, shlex, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid
+import argparse, difflib, json, os, random, re, select, shlex, shutil, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -215,6 +215,229 @@ TOOLS = [
 def trunc(s, n=30000):
     return s if len(s) <= n else s[:n] + f"\n... [truncated {len(s)-n} chars]"
 
+# --- Terminal UI (Codex-style) -------------------------------------------------
+# The TUI is line-based (stdlib only, no alternate screen): a boxed header, a
+# coloured `[mode] >` prompt, an animated `⠋ Working (2s)` spinner while the
+# model / a tool runs, and collapsed tool lines (`✓ Ran ... · 0.4s` with
+# indented, dim output) instead of raw argument/result dumps. Colour is
+# tty-only (never with NO_COLOR / TERM=dumb), so piped output stays plain.
+
+VERBOSE = os.environ.get("NADA_VERBOSE", "").lower() in {"1", "true", "yes", "on"}
+TOOL_OUTPUT_MAX_LINES = 12
+DIFF_MAX_LINES = 40
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_MODE_COLORS = {"default": "2", "accept-edits": "32", "plan": "33",
+                "auto": "36", "yolo": "31"}
+
+def _use_color(stream=None):
+    """True if `stream` (default stdout) is a colour-capable tty."""
+    if "NO_COLOR" in os.environ or os.environ.get("TERM") == "dumb":
+        return False
+    stream = sys.stdout if stream is None else stream
+    try:
+        return bool(stream.isatty())
+    except Exception:
+        return False
+
+def _ansi(text, *codes):
+    return f"\x1b[{';'.join(codes)}m{text}\x1b[0m"
+
+def _style(text, *codes, stream=None):
+    return _ansi(text, *codes) if _use_color(stream) else text
+
+def _bold(t, stream=None): return _style(t, "1", stream=stream)
+def _dim(t, stream=None): return _style(t, "2", stream=stream)
+def _green(t, stream=None): return _style(t, "32", stream=stream)
+def _red(t, stream=None): return _style(t, "31", stream=stream)
+def _yellow(t, stream=None): return _style(t, "33", stream=stream)
+
+def _strip_ansi(s):
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", str(s))
+
+def _terminal_width():
+    try:
+        return max(40, min(80, shutil.get_terminal_size((80, 24)).columns))
+    except Exception:
+        return 80
+
+def format_duration(seconds):
+    """Human duration: 40ms, 1.2s, 2m 3s."""
+    seconds = max(0.0, float(seconds or 0))
+    if seconds < 1:
+        return f"{round(seconds * 1000)}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s".replace(".0s", "s")
+    minutes, secs = divmod(seconds, 60)
+    return f"{int(minutes)}m {secs:.0f}s"
+
+def _one_line(s, n=80):
+    """Whitespace-collapsed, ellipsis-truncated one-liner."""
+    text = " ".join(str(s or "").split())
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+def tool_summary(name, args, *, running=False):
+    """Short Codex-style verb + target: `Ran ls -R`, `Read nada.py`,
+    `Edited x.py` (`running=True` gives the present-tense spinner form)."""
+    args = args or {}
+    if name == "bash":
+        return f"{'Running' if running else 'Ran'} {_one_line(args.get('command'), 72) or 'command'}"
+    if name == "read_file":
+        return f"{'Reading' if running else 'Read'} {args.get('path') or 'file'}"
+    if name == "write_file":
+        return f"{'Writing' if running else 'Wrote'} {args.get('path') or 'file'}"
+    if name == "edit_file":
+        return f"{'Editing' if running else 'Edited'} {args.get('path') or 'file'}"
+    return f"{'Calling' if running else 'Called'} {name}"
+
+def _bash_output(result):
+    """(exit code | None, body lines) from bash()'s `$ cmd\n[exit N]\n...`."""
+    lines = str(result or "").splitlines()
+    if (len(lines) >= 2 and lines[0].startswith("$ ")
+            and re.fullmatch(r"\[exit -?\d+\]", lines[1].strip())):
+        return int(lines[1].strip()[6:-1]), lines[2:]
+    return None, lines
+
+def format_tool_result(name, args, result, *, ok=True, duration=None, verbose=False):
+    """Collapsed one-block rendering of a finished tool call.
+
+    `✓ Ran ... · 0.4s` (or `✗ ... · exit 1`) followed by indented, dim
+    output -- capped at TOOL_OUTPUT_MAX_LINES unless `verbose`. Successful
+    read/write/edit calls show no body: the head line already says what
+    happened, and the full result still goes to the model."""
+    result = str(result or "")
+    exit_code, body = _bash_output(result) if name == "bash" else (None, result.splitlines())
+    extras = []
+    if exit_code not in (None, 0):
+        extras.append(f"exit {exit_code}")
+    if name == "read_file" and ok and body and not result.startswith("Error:"):
+        extras.append(f"{len(body)} lines")
+    if duration is not None and duration >= 0.05:
+        extras.append(format_duration(duration))
+    mark = "✓" if ok else "✗"
+    head = f"{_green(mark) if ok else _red(mark)} {_bold(tool_summary(name, args))}"
+    lines = [head + (f" · {' · '.join(extras)}" if extras else "")]
+    if not ok or name == "bash" or verbose:
+        shown = body if verbose else body[:TOOL_OUTPUT_MAX_LINES]
+        lines += [_dim(f"  {ln}") for ln in shown]
+        if not verbose and len(body) > TOOL_OUTPUT_MAX_LINES:
+            lines.append(_dim(f"  … {len(body) - TOOL_OUTPUT_MAX_LINES} more "
+                              "lines (/verbose for full output)"))
+    return "\n".join(lines)
+
+def format_diff(old, new, path="", *, max_lines=DIFF_MAX_LINES):
+    """Unified diff rendering: `-` red, `+` green, context/headers dim,
+    capped at `max_lines` lines."""
+    old_lines, new_lines = str(old or "").splitlines(), str(new or "").splitlines()
+    if old_lines == new_lines:
+        return _dim("(no changes)")
+    diff = difflib.unified_diff(old_lines, new_lines,
+                                fromfile=str(path or "a"), tofile=str(path or "b"),
+                                lineterm="", n=2)
+    out = []
+    for ln in diff:
+        if ln.startswith(("+", "-")) and not ln.startswith(("+++", "---")):
+            out.append(_green(ln) if ln.startswith("+") else _red(ln))
+        else:
+            out.append(_dim(ln))
+    if len(out) > max_lines:
+        out = out[:max_lines] + [_dim(f"… {len(out) - max_lines} more diff lines")]
+    return "\n".join(out)
+
+def _usage_counts(usage):
+    usage = usage or {}
+    return (usage.get("prompt_tokens") or usage.get("input_tokens") or 0,
+            usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+
+def format_usage(usage):
+    """`tokens: 1,234 in · 567 out`, or None if the provider sent no usage."""
+    inc, out = _usage_counts(usage)
+    if not inc and not out:
+        return None
+    return f"tokens: {inc:,} in · {out:,} out"
+
+def _add_usage(total, usage):
+    inc, out = _usage_counts(usage)
+    total["prompt_tokens"] += inc
+    total["completion_tokens"] += out
+
+def format_banner(model=None, root=None, mode=None, effort=None,
+                  session_id=None, session_path=None, agents=None, width=None):
+    """The boxed Codex-style header shown at REPL startup (plain text when
+    not on a tty: the box is drawn either way, only colours change)."""
+    model = MODEL if model is None else model
+    root = ROOT if root is None else root
+    mode = PERMS.mode if mode is None else mode
+    width = width or _terminal_width()
+    color = _use_color()
+    lines = [
+        f"nada · {model}",
+        str(root),
+        f"{mode} · effort: {effort or '(model default)'} · session: {session_id or ''}",
+    ]
+    if agents:
+        lines.append("AGENTS.md: " + ", ".join(agents))
+    lines.append("/help for commands · Ctrl+Tab cycles permissions · /quit to exit")
+    inner = max(10, width - 4)
+    box = ["╭" + "─" * (width - 2) + "╮"]
+    for i, ln in enumerate(lines):
+        text = _one_line(ln, inner) if len(ln) > inner else ln
+        padded = text.ljust(inner)
+        styled = _ansi(padded, "1" if i == 0 else "2") if color else padded
+        box.append(f"│ {styled} │")
+    box.append("╰" + "─" * (width - 2) + "╯")
+    return "\n".join(box)
+
+def spinner_frame(i):
+    return SPINNER_FRAMES[i % len(SPINNER_FRAMES)]
+
+class Spinner:
+    """Animated status line (`⠋ Working (2s)`) for slow model/tool calls.
+
+    Tty-only and a no-op otherwise (piped/test output is untouched); the
+    line is cleared on exit so the next print starts clean."""
+
+    def __init__(self, label, stream=None):
+        self.label = _one_line(label, 60)
+        self.stream = sys.stdout if stream is None else stream
+        self._stop = threading.Event()
+        self._thread = None
+        self._start = time.monotonic()
+
+    def _enabled(self):
+        try:
+            return bool(self.stream.isatty()) and os.environ.get("TERM") != "dumb"
+        except Exception:
+            return False
+
+    def __enter__(self):
+        if self._enabled():
+            self._thread = threading.Thread(target=self._spin, daemon=True)
+            self._thread.start()
+        return self
+
+    def _spin(self):
+        idx = 0
+        while not self._stop.wait(0.08):
+            elapsed = int(time.monotonic() - self._start)
+            try:
+                self.stream.write(f"\r\x1b[K  {spinner_frame(idx)} "
+                                  f"{self.label} ({elapsed}s)")
+                self.stream.flush()
+            except Exception:
+                return
+            idx += 1
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+            try:
+                self.stream.write("\r\x1b[K")
+                self.stream.flush()
+            except Exception:
+                pass
+        return False
+
 def resolve(p):
     p = Path(p)
     p = p.resolve() if p.is_absolute() else (ROOT / p).resolve()
@@ -381,17 +604,27 @@ def _pattern_for(name, args):
         return str(args.get("path", "")).strip() or None
     return None
 
+def _existing_text(path):
+    """Current on-disk text of `path` (for diff previews), or "" if it does
+    not exist / is not readable inside the workspace."""
+    try:
+        p = resolve(path)
+        return p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
+    except Exception:
+        return ""
+
 def _preview(name, args):
     """Human-facing rendering for prompts/prints -- truncated for the
-    terminal. The reviewer must NOT judge this; see _action_json()."""
+    terminal, Codex-style (a `$ command` line or a +/- diff). The reviewer
+    must NOT judge this; see _action_json()."""
     if name == "bash":
-        return f"bash: {args.get('command', '')}"
+        return f"$ {args.get('command', '')}"
     if name == "write_file":
-        return f"write_file: {args.get('path', '')}\n{trunc(str(args.get('content', '')), 1000)}"
+        return format_diff(_existing_text(args.get("path", "")),
+                           str(args.get("content", "")), str(args.get("path", "")))
     if name == "edit_file":
-        return (f"edit_file: {args.get('path', '')}\n"
-                f"--- old_string ---\n{trunc(str(args.get('old_string', '')), 1000)}\n"
-                f"--- new_string ---\n{trunc(str(args.get('new_string', '')), 1000)}")
+        return format_diff(str(args.get("old_string", "")), str(args.get("new_string", "")),
+                           str(args.get("path", "")))
     return f"{name}: {trunc(json.dumps(args, default=str), 1000)}"
 
 def _action_json(name, args):
@@ -488,7 +721,7 @@ class Permissions:
                                 "permissions, --permission-mode auto to have a reviewer model "
                                 "approve, --permission-mode accept-edits to auto-approve "
                                 "edits, or run interactively to be prompted")
-            print(f"\n[permission] denied {name}: {self.last_reason}.")
+            print(f"\n{_red('✗')} [permission] denied {name}: {self.last_reason}.")
             return False
         allowed = self._ask(name, args, pattern)
         if not allowed:
@@ -505,33 +738,36 @@ class Permissions:
             verdict = reviewer(name, args, context)
         except Exception as e:
             self.last_reason = f"auto-reviewer unavailable: {e}"
-            print(f"\n[auto-review] denied {name}: {self.last_reason}")
+            print(f"\n{_red('✗')} [auto-review] denied {name}: {self.last_reason}")
             return False
         approved, rationale = verdict if isinstance(verdict, tuple) else (bool(verdict), "")
         if not approved:
             self.last_reason = f"auto-reviewer denied: {rationale or 'reviewer did not approve'}"
-        print(f"\n[auto-review] {'approved' if approved else 'denied'} {name}"
+        mark = _green("✓") if approved else _red("✗")
+        print(f"\n{mark} [auto-review] {'approved' if approved else 'denied'} {name}"
               + (f": {rationale}" if rationale else ""))
         print(_preview(name, args))
         return approved
 
     def _ask(self, name, args, pattern):
-        print(f"\n[permission] Allow this tool call?")
+        print(f"\n{_bold('Allow this tool call?')}  {tool_summary(name, args, running=True)}")
         print(_preview(name, args))
-        print("[y]es once  [a]lways allow this exact command/path this session  [n]o")
+        print("  1. Yes — allow once")
+        print("  2. Yes — always allow this exact command/path this session")
+        print("  3. No — deny (the model will be told why)")
         while True:
             try:
                 ans = self._input("Allow? [y/a/n] ").strip().lower()
             except (EOFError, KeyboardInterrupt):
-                print("\n[permission] denied (no input)")
+                print(f"\n{_red('✗')} [permission] denied (no input)")
                 return False
-            if ans in {"y", "yes"}:
+            if ans in {"y", "yes", "1"}:
                 return True
-            if ans in {"a", "always"}:
+            if ans in {"a", "always", "2"}:
                 if pattern is not None:
                     self.allowlist.add((name, pattern))
                 return True
-            if ans in {"n", "no"}:
+            if ans in {"n", "no", "3"}:
                 return False
             print("Please enter y, a, or n.")
 
@@ -593,8 +829,13 @@ def _next_byte(in_buf, timeout=0.05):
         pass
     return in_buf.read(1) or None
 
-def _repl_prompt(perms):
-    return f"[{perms.mode}] > "
+def _repl_prompt(perms, stream=None):
+    """`[mode] > ` -- the mode is colour-coded per mode on a tty
+    (plan=yellow, yolo=red, ...), plain text elsewhere."""
+    label = f"[{perms.mode}]"
+    if _use_color(stream):
+        return f"{_ansi(label, _MODE_COLORS.get(perms.mode, '2'))} {_ansi('>', '1')} "
+    return f"{label} > "
 
 def _read_line_raw(perms, in_buf, out, history=None):
     """Read one REPL line in raw mode (caller sets terminal raw mode).
@@ -606,7 +847,7 @@ def _read_line_raw(perms, in_buf, out, history=None):
     hist, hist_idx, saved = list(history or []), None, ""
 
     def redraw():
-        prompt = _repl_prompt(perms)
+        prompt = _repl_prompt(perms, stream=out)
         out.write("\r\x1b[K" + prompt + "".join(buf))
         if cursor < len(buf):
             out.write(f"\x1b[{len(buf) - cursor}D")
@@ -617,7 +858,7 @@ def _read_line_raw(perms, in_buf, out, history=None):
         buf, cursor = list(text), len(text)
         redraw()
 
-    out.write(_repl_prompt(perms)); out.flush()
+    out.write(_repl_prompt(perms, stream=out)); out.flush()
     while True:
         b = in_buf.read(1)
         if not b:
@@ -773,6 +1014,11 @@ def parse_args(argv=None):
                    help="directory for saved sessions (default: $AGENT_SESSION_DIR or ~/.nada/sessions)")
     p.add_argument("--no-autosave", dest="no_autosave", action="store_true",
                    help="do not auto-save the session after each turn (REPL /session save still works)")
+    p.add_argument("--no-color", dest="no_color", action="store_true",
+                   help="disable coloured output (same as $NO_COLOR)")
+    p.add_argument("--verbose", dest="verbose", action="store_true",
+                   help="show full tool output instead of the collapsed Codex-style view "
+                        "(same as $NADA_VERBOSE or /verbose on)")
     p.add_argument("task", nargs="*", help="task to run non-interactively; omit for the REPL")
     return p.parse_args(argv)
 
@@ -843,7 +1089,7 @@ def call_model(messages, model=None, use_tools=True, *, max_retries=None, sleep_
             headers = getattr(e, "headers", None)
             delay = _backoff_delay(attempt, _parse_retry_after(
                 headers.get("Retry-After") if headers else None))
-            print(f"[rate-limit] OpenRouter 429; retrying in {delay:.1f}s "
+            print(f"{_yellow('⏳', stream=sys.stderr)} [rate-limit] OpenRouter 429; retrying in {delay:.1f}s "
                   f"({attempt + 1}/{retries})", file=sys.stderr)
             sleep_fn(delay)
 
@@ -921,38 +1167,69 @@ def review_action(name, args, context=None):
         return first_denial  # failed resample: keep the original denial
     raise last_err or RuntimeError("reviewer returned no verdict")
 
+def _message_text(content):
+    """Display text of a model message (content may be a list of parts)."""
+    if isinstance(content, list):
+        return "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+    return str(content or "")
+
 def run_turns(messages):
+    usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    printed_activity = False
     for _ in range(MAX_TURNS):
-        msg = call_model(messages)["choices"][0]["message"]
+        with Spinner("Working"):
+            reply = call_model(messages)
+        _add_usage(usage, reply.get("usage"))
+        msg = reply["choices"][0]["message"]
         messages.append(msg)  # verbatim — required for tool_calls validation
-        if msg.get("content"): print(msg["content"])
+        text = _message_text(msg.get("content"))
+        if text:
+            if printed_activity:
+                print()  # separate the final answer from the tool activity
+            print(text)
         calls = msg.get("tool_calls") or []
-        if not calls: return
+        if not calls:
+            usage_line = format_usage(usage)
+            if usage_line:
+                print(f"\n  {_dim(usage_line)}")
+            return
         for call in calls:
             fn = call["function"]; name = fn["name"]
             try:
                 args = json.loads(fn.get("arguments") or "{}")
             except Exception as e:
                 result = f"Error: {type(e).__name__}: {e}"
-                print(f"\n[{name}] invalid arguments\n{result}")
+                print(format_tool_result(name, {}, result, ok=False))
+                printed_activity = True
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": trunc(result)})
                 continue
             if name not in HANDLERS:
                 result = f"Error: unknown tool: {name}"
+                ok = False
+                duration = None
             elif not PERMS.check(name, args, context=list(messages)):
                 # Full back-and-forth (user requests retained) for the
                 # reviewer; the denial reason reaches the model, so it can
                 # adapt or tell the user exactly what was refused.
                 reason = PERMS.last_reason or f"permission mode: {PERMS.mode}"
                 result = f"Error: PermissionDenied: denied {name} ({reason})"
+                ok = False
+                duration = None
             else:
+                started = time.monotonic()
                 try:
-                    result = HANDLERS[name](args)
+                    with Spinner(tool_summary(name, args, running=True)):
+                        result = HANDLERS[name](args)
                 except Exception as e:
                     result = f"Error: {type(e).__name__}: {e}"
-            print(f"\n[{name}] {fn.get('arguments')}\n{trunc(result, 2000)}")
+                duration = time.monotonic() - started
+                exit_code, _ = _bash_output(result) if name == "bash" else (None, [])
+                ok = not result.startswith("Error:") and exit_code in (None, 0)
+            print(format_tool_result(name, args, result, ok=ok,
+                                     duration=duration, verbose=VERBOSE))
+            printed_activity = True
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": trunc(result)})
-    print(f"Stopped after {MAX_TURNS} turns")
+    print(f"{_yellow('⚠')} Stopped after {MAX_TURNS} turns")
 
 def handle_permissions_command(parts, perms=None):
     """Handle `/mode ...` and `/permissions ...` (same options; `/mode clear`
@@ -968,7 +1245,7 @@ def handle_permissions_command(parts, perms=None):
             print("  (empty)")
     elif parts[1] == "clear" and parts[0] == "/permissions":
         perms.allowlist.clear()
-        print("Session allowlist cleared")
+        print("✓ Session allowlist cleared")
     else:
         try:
             mode = perms.set_mode(parts[1])
@@ -977,7 +1254,7 @@ def handle_permissions_command(parts, perms=None):
                   "(aliases: ask, approve-edits, acceptEdits, deny, approve-for-me, bypass-permissions)")
             print("       /permissions [default|accept-edits|plan|auto|yolo|clear]")
         else:
-            print(f"Permissions mode: {mode} ({perms.describe()})")
+            print(f"✓ Permissions mode: {mode} ({perms.describe()})")
 
 # /mode is the Claude-style spelling; /permissions keeps its allowlist/clear.
 handle_mode_command = handle_permissions_command
@@ -1002,20 +1279,81 @@ def handle_effort_command(parts):
         return
     if normalize_effort(parts[1]) is None:
         set_effort(None)
-        print(f"Effort cleared: model default for {MODEL}")
+        print(f"✓ Effort cleared: model default for {MODEL}")
         return
     try:
         supported = discover_efforts()
     except Exception as e:  # offline etc.: validate against gateway levels only
-        print(f"Warning: could not discover effort levels for {MODEL} ({e}); "
+        print(f"{_yellow('⚠')} Warning: could not discover effort levels for {MODEL} ({e}); "
               "validating against all gateway levels only")
         supported = None
     try:
         level = set_effort(parts[1], supported)
     except ValueError as e:
-        print(f"Invalid effort: {e}  (usage: /effort [LEVEL|clear])")
+        print(f"{_red('✗')} Invalid effort: {e}  (usage: /effort [LEVEL|clear])")
         return
-    print(f"Effort set: {level} for {MODEL}")
+    print(f"✓ Effort set: {level} for {MODEL}")
+
+HELP_TEXT = """Commands:
+  /help                         show this help
+  /status                       show model, permissions, effort, and session
+  /verbose [on|off]             show full tool output (default: collapsed)
+  /mode [MODE]                  permission mode (default|accept-edits|plan|auto|yolo)
+  /permissions [MODE|clear]     mode, or show/clear the session allowlist
+  /effort [LEVEL|clear]         model reasoning effort (no argument lists levels)
+  /session [save [TITLE]|list|resume ID|new|delete ID|path]  (aliases: /sessions, /resume ID)
+  /clear                        start a fresh conversation
+  /quit                         exit
+At the prompt, Ctrl+Tab / Shift+Tab cycles permission modes."""
+
+def handle_help_command(parts=None):
+    """Handle `/help`."""
+    print(HELP_TEXT)
+
+def handle_verbose_command(parts):
+    """Handle `/verbose [on|off]`: toggle full (uncollapsed) tool output."""
+    global VERBOSE
+    if len(parts) > 1:
+        if parts[1] in {"on", "1", "true", "yes"}:
+            VERBOSE = True
+        elif parts[1] in {"off", "0", "false", "no"}:
+            VERBOSE = False
+        else:
+            print("Usage: /verbose [on|off]")
+            return VERBOSE
+    print(f"Verbose output: {'on' if VERBOSE else 'off'} "
+          f"(tool output is shown {'in full' if VERBOSE else 'collapsed'})")
+    return VERBOSE
+
+_UNSET = object()
+
+def format_status(session=None, reasoning=_UNSET, *, perms=None):
+    """Multi-line `/status` report (model, root, permissions, effort,
+    verbose, and session when one is given)."""
+    perms = PERMS if perms is None else perms
+    if reasoning is _UNSET:
+        reasoning = None
+    lines = [
+        f"Model: {MODEL}",
+        f"Root: {ROOT}",
+        f"Permissions: {perms.mode} ({perms.describe()})",
+        _effort_summary(reasoning),
+        f"Verbose output: {'on' if VERBOSE else 'off'}",
+    ]
+    if session is not None:
+        lines += [f"Session: {session.id} ({session.path()})",
+                  f"Turns: {session.turns}"]
+    return "\n".join(lines)
+
+def handle_status_command(session=None, reasoning=_UNSET):
+    """Handle `/status` (effort levels are discovered live, like /effort)."""
+    if reasoning is _UNSET:
+        try:
+            reasoning = fetch_model_reasoning()
+        except Exception as e:
+            print(f"{_yellow('⚠')} Warning: could not discover effort levels for {MODEL} ({e})")
+            reasoning = None
+    print(format_status(session, reasoning))
 
 # --- Sessions --------------------------------------------------------------
 # A session is the persisted conversation state: messages (stored verbatim,
@@ -1169,7 +1507,7 @@ class SessionStore:
             try:
                 summaries.append(session_summary(self._load_file(path)))
             except Exception as e:
-                print(f"Warning: skipping {path.name}: {e}", file=sys.stderr)
+                print(f"{_yellow('⚠', stream=sys.stderr)} Warning: skipping {path.name}: {e}", file=sys.stderr)
         summaries.sort(key=lambda s: s["updated_at"], reverse=True)
         return summaries
 
@@ -1228,7 +1566,7 @@ class Session:
         try:
             self.save()
         except Exception as e:
-            print(f"Warning: could not save session {self.id} ({e})", file=sys.stderr)
+            print(f"{_yellow('⚠', stream=sys.stderr)} Warning: could not save session {self.id} ({e})", file=sys.stderr)
             return False
         return True
 
@@ -1258,7 +1596,7 @@ class Session:
             try:
                 set_effort(data.get("effort"), supported_efforts)
             except ValueError as e:
-                print(f"Warning: saved effort {data.get('effort')!r} not applied ({e})")
+                print(f"{_yellow('⚠')} Warning: saved effort {data.get('effort')!r} not applied ({e})")
         if data.get("root") and data["root"] != str(ROOT):
             print(f"Note: session was created in {data['root']}; current root is {ROOT}")
         return self
@@ -1297,12 +1635,12 @@ def handle_session_command(parts, session):
         try:
             path = session.save()
         except Exception as e:
-            print(f"Could not save session: {e}")
+            print(f"{_red('✗')} Could not save session: {e}")
         else:
-            print(f"Session saved: {session.id} ({path})")
+            print(f"✓ Session saved: {session.id} ({path})")
     elif sub == "new":
         session.reset()
-        print(f"New session: {session.id}")
+        print(f"✓ New session: {session.id}")
     elif sub == "path":
         print(session.path())
     elif sub in {"resume", "load", "continue"}:
@@ -1313,12 +1651,12 @@ def handle_session_command(parts, session):
         try:
             data = session.store.load(target)
         except FileNotFoundError:
-            print(f"Session not found: {target}")
+            print(f"{_red('✗')} Session not found: {target}")
         except Exception as e:
-            print(f"Could not resume session {target}: {e}")
+            print(f"{_red('✗')} Could not resume session {target}: {e}")
         else:
             session.restore(data)
-            print(f"Resumed session: {session.id} ({session.turns} turns)")
+            print(f"✓ Resumed session: {session.id} ({session.turns} turns)")
     elif sub == "delete":
         if not args:
             print(_SESSION_USAGE)
@@ -1326,20 +1664,25 @@ def handle_session_command(parts, session):
         try:
             deleted = session.store.delete(args[0])
         except ValueError as e:
-            print(f"Could not delete session: {e}")
+            print(f"{_red('✗')} Could not delete session: {e}")
             return
         if not deleted:
-            print(f"Session not found: {args[0]}")
+            print(f"{_red('✗')} Session not found: {args[0]}")
             return
-        print(f"Deleted session: {args[0]}")
+        print(f"✓ Deleted session: {args[0]}")
         if args[0] == session.id:  # don't let autosave resurrect the live session
             session.reset()
-            print(f"New session: {session.id}")
+            print(f"✓ New session: {session.id}")
     else:
         print(_SESSION_USAGE)
 
 def main():
     args = parse_args()
+    if args.no_color:
+        os.environ["NO_COLOR"] = "1"
+    if args.verbose:
+        global VERBOSE
+        VERBOSE = True
     if _PERM_ERROR and not (args.yes or args.permission_mode or args.accept_edits or args.plan):
         sys.exit(f"error: {_PERM_ERROR}")
     if args.accept_edits:
@@ -1361,7 +1704,7 @@ def main():
     try:
         _reasoning = fetch_model_reasoning()
     except Exception as e:
-        print(f"Warning: could not discover effort levels for {MODEL} ({e}); "
+        print(f"{_yellow('⚠', stream=sys.stderr)} Warning: could not discover effort levels for {MODEL} ({e}); "
               "continuing without per-model validation", file=sys.stderr)
         _reasoning = None
     if EFFORT is not None:
@@ -1382,7 +1725,7 @@ def main():
             sys.exit(f"error: could not load session {target}: {e}")
         session.restore(data, apply_effort=args.effort is None,
                         supported_efforts=_reasoning["supported_efforts"] if _reasoning else None)
-        print(f"Resumed session: {session.id} ({session.turns} turns)")
+        print(f"✓ Resumed session: {session.id} ({session.turns} turns)")
     if args.task:
         session.messages.append({"role": "user", "content": " ".join(args.task)})
         try:
@@ -1390,15 +1733,12 @@ def main():
         finally:
             session.try_save()
         return
-    print(f"Model: {MODEL}\n{_effort_summary(_reasoning)}\nRoot: {ROOT}\nPermissions: {PERMS.mode} ({PERMS.describe()})")
     _agents = load_agents_instructions()
-    if _agents:
-        print("AGENTS.md: " + ", ".join(rel for rel, _ in _agents))
-    print(f"Session: {session.id} ({session.path()})")
-    print("/quit to exit, /clear to reset, /mode [default|accept-edits|plan|auto|yolo] to switch modes, "
-          "/effort [LEVEL|clear] to set model effort, "
-          "/session [save|list|resume ID|new] to manage sessions")
-    print("Ctrl+Tab / Shift+Tab at the prompt cycles modes; /permissions shows the session allowlist")
+    print(format_banner(model=MODEL, root=ROOT, mode=PERMS.mode,
+                        effort=EFFORT or "(model default)",
+                        session_id=session.id, session_path=session.path(),
+                        agents=[rel for rel, _ in _agents] or None))
+    print(f"  {_dim(_effort_summary(_reasoning))}")
     while True:
         print()
         try: task = read_repl_line(PERMS, session.history).strip()
@@ -1407,6 +1747,12 @@ def main():
             break
         if task in {"/quit", "/exit"}: break
         if task == "/clear": session.messages[:] = [{"role": "system", "content": build_system_prompt()}]; continue
+        if task.split() and task.split()[0] == "/help":
+            handle_help_command(task.split()); continue
+        if task.split() and task.split()[0] == "/status":
+            handle_status_command(session); continue
+        if task.split() and task.split()[0] == "/verbose":
+            handle_verbose_command(task.split()); continue
         if task.split() and task.split()[0] in {"/permissions", "/mode"}:
             handle_permissions_command(task.split()); continue
         if task.split() and task.split()[0] == "/effort":
@@ -1417,7 +1763,7 @@ def main():
             session.history.append(task)
             session.messages.append({"role": "user", "content": task})
             try: run_turns(session.messages)
-            except Exception as e: print(f"Error: {e}")
+            except Exception as e: print(f"{_red('✗')} Error: {e}")
             finally: session.try_save()
     session.try_save()
 

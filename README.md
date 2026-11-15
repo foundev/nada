@@ -13,9 +13,36 @@ python3 nada.py "add a README"        # one-shot task
 python3 nada.py --help
 ```
 
-REPL commands: `/quit`, `/clear`, `/mode [MODE]`, `/permissions [MODE|clear]`,
-`/effort [LEVEL|clear]`, `/session [save [TITLE]|list|resume ID|new|delete ID|path]`
+REPL commands: `/help`, `/status`, `/verbose [on|off]`, `/quit`, `/clear`,
+`/mode [MODE]`, `/permissions [MODE|clear]`, `/effort [LEVEL|clear]`,
+`/session [save [TITLE]|list|resume ID|new|delete ID|path]`
 (aliases: `/sessions`, `/resume ID`).
+
+## Terminal UI
+
+The REPL borrows Codex's look (still line-based and stdlib-only — no
+alternate screen):
+
+- A boxed header at startup with the model, working directory, permission
+  mode, effort, and session, plus an effort summary line below it.
+- A colour-coded prompt — `[mode] > `, with the mode in its own colour
+  (`plan` yellow, `yolo` red, `auto` cyan, `accept-edits` green). Colour is
+  tty-only: piped output and one-shot runs stay plain text, and `$NO_COLOR`
+  (or `--no-color`) disables it everywhere.
+- An animated `⠋ Working (2s)` spinner while the model or a long tool call
+  runs (tty only).
+- Collapsed tool lines — `✓ Ran python3 -m unittest -v · 1.2s`,
+  `✓ Edited nada.py`, `✓ Read nada.py · 1425 lines`, `✗ Ran make · exit 1` —
+  with command output indented and dimmed underneath, capped at 12 lines
+  (`… N more lines`). Reads/edits show no body, and neither do raw argument
+  dumps. `/verbose on` (or `--verbose` / `$NADA_VERBOSE=1`) shows full tool
+  output instead. A turn that uses tokens ends with a dim
+  `tokens: 1,234 in · 567 out` footer.
+- Approval prompts show the action as a `$ command` line or a `+`/`-` diff,
+  with numbered options (`1`/`2`/`3`, same as `y`/`a`/`n`).
+
+`/help` lists all commands; `/status` shows the model, root, permissions,
+effort, verbose setting, and session.
 
 ## AGENTS.md
 
@@ -108,14 +135,16 @@ there's no cycling; use `/mode`.
 
 ### Prompting
 
-For each gated call you are shown the tool, its arguments (a preview of the
-file contents / edit, or the shell command), and asked:
+For each gated call you are shown the action (a `$ command` line or a
+`+`/`-` diff of the edit), and asked — the numbered options are the same
+answers as the letters:
 
-- `y` — allow once
-- `a` — always allow *this exact command or file path* for the rest of the
-  session (a different command/path prompts again; `/permissions clear`
+- `1` / `y` — allow once
+- `2` / `a` — always allow *this exact command or file path* for the rest of
+  the session (a different command/path prompts again; `/permissions clear`
   forgets these)
-- `n` — deny; the model receives a `PermissionDenied` result and can adapt
+- `3` / `n` — deny; the model receives a `PermissionDenied` result and can
+  adapt
 
 EOF/Ctrl-C at the prompt denies the call.
 
@@ -220,6 +249,8 @@ corrupt session files are skipped with a warning when listing.
 | `AGENT_RETRY_BASE_DELAY` | `1` | seconds; first 429 wait (doubled every retry) |
 | `AGENT_RETRY_MAX_DELAY` | `60` | cap in seconds on a single backoff wait (`Retry-After` can exceed it) |
 | `AGENT_RETRY_BACKOFF` | `2` | multiplier applied to the wait after each 429 |
+| `NADA_VERBOSE` | off | show full tool output instead of the collapsed view (`--verbose` / `/verbose on` overrides) |
+| `NO_COLOR` | — | disable coloured output (or pass `--no-color`) |
 
 ## Rate limits (429)
 
