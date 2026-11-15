@@ -15,6 +15,7 @@ python3 nada.py --help
 
 REPL commands: `/help`, `/status`, `/verbose [on|off]`, `/quit`, `/clear`,
 `/mode [MODE]`, `/permissions [MODE|clear]`, `/effort [LEVEL|clear]`,
+`/model [MODEL_ID]`,
 `/session [save [TITLE]|list|resume ID|new|delete ID|path]`
 (aliases: `/sessions`, `/resume ID`).
 
@@ -113,7 +114,8 @@ Set the mode with `--permission-mode MODE` (or `--mode`), `--accept-edits`,
 variable, or in the REPL with `/mode MODE` / `/permissions MODE` (CLI flags
 override the env var; `--permission-mode` overrides `--accept-edits`/`--plan`/
 `--yes`). `/permissions` with no argument also shows the session allowlist;
-`/permissions clear` forgets it.
+`/permissions clear` forgets it. A mode selected in nada is saved for the
+next run (see Model, effort, and permission-mode persistence below).
 
 ### Auto-review (`auto` mode)
 
@@ -145,8 +147,9 @@ OpenRouter. `yolo` is the old behaviour of `auto`: no prompt, no review.
 
 At the REPL prompt, press **Ctrl+Tab** (or Shift+Tab) to cycle
 `default → accept-edits → plan → auto → yolo → default`; Ctrl+Shift+Tab cycles
-backwards. The statusline redraws with the new mode immediately, and any
-text you've typed is kept.
+backwards. The statusline redraws with the new mode immediately, any
+text you've typed is kept, and the cycled-to mode is saved for the next
+run.
 
 Terminals don't agree on a Ctrl+Tab encoding, so several are recognised
 (kitty/xterm `ESC[27;5;9~`-style sequences and Shift+Tab `ESC[Z`). Some
@@ -219,6 +222,45 @@ shows the levels available for the current model, and `/effort clear` (or
 `none`, `x-high`/`extra-high` → `xhigh`. An invalid level for the model exits
 with an error listing the available ones.
 
+The model itself is selected with `--model MODEL_ID`, the `MODEL` environment
+variable, or in the REPL with `/model MODEL_ID` (`/model` alone shows the
+current one). Switching model clears the effort if the new model does not
+offer it.
+
+## Model, effort, and permission-mode persistence
+
+The last model, effort, and permission mode selected *in nada* are saved
+to `~/.nada/settings.json` and reloaded on the next run, so a fresh
+session starts with your selection instead of the built-in defaults:
+
+```json
+{"version": 1, "model": "openai/gpt-5.2", "effort": "high",
+ "permission_mode": "accept-edits", "updated_at": "..."}
+```
+
+- Saved on: `--model` / `--effort` / `--permission-mode` (and
+  `--yes` / `--accept-edits` / `--plan`) on the command line, `/model` /
+  `/effort` / `/mode` (including `/effort clear`, which saves the model
+  default) in the REPL, Ctrl+Tab cycling at the prompt, and — for
+  model/effort only — when a session is resumed.
+- Precedence at startup: command line > environment variables (`MODEL` /
+  the effort vars / `AGENT_PERMISSION_MODE`) > saved settings > built-in
+  default (`meta/muse-ember`, model default effort, `default` mode).
+  Env vars are *not* saved — they already override every run they're set
+  in.
+- A saved effort the current model does not support (e.g. after switching
+  models) is dropped with a warning, not fatal; an invalid saved mode is
+  dropped likewise; a corrupt settings file is ignored with a warning.
+  Writes are atomic (temp file + rename), like sessions. Override the
+  location with `NADA_SETTINGS_FILE`. `--no-autosave` only affects
+  sessions, not settings.
+- Note the asymmetry with sessions: a *session* file never restores a
+  permission mode (loading a file must not silently escalate), but the
+  settings file is your own recorded preference, so a saved mode —
+  including `yolo` — does apply on the next run. It is always visible in
+  the statusline, and `--permission-mode`/the env var still override it
+  for that run.
+
 ## Sessions
 
 Conversations are persisted as sessions and survive quitting. A session is
@@ -248,8 +290,10 @@ one, `/session new` starts a fresh one, and `/session delete ID` removes
 one (deleting the live session starts a new one, so autosave can't
 resurrect it). Resuming regenerates the system prompt for the current
 working directory and reports it if the session was created elsewhere;
-the saved effort is restored (unless `--effort` was given), but the
-permission mode and session allowlist are deliberately **not** restored —
+the saved model and effort are restored (unless `--model` / `--effort`
+was given), but the permission mode and session allowlist are deliberately
+**not** restored from the session (a saved *settings* mode still applies —
+see persistence above) —
 loading a file must not silently escalate permissions, so re-apply them
 with `/mode` / the usual prompts. Session ids are simple file stems;
 anything else (`..`, `/`) is rejected, unknown ids are an error, and
@@ -260,10 +304,11 @@ corrupt session files are skipped with a warning when listing.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `OPENROUTER_API_KEY` | — | required |
-| `MODEL` | `meta/muse-ember` | model id |
+| `MODEL` | saved model, else `meta/muse-ember` | model id (`--model` overrides; see Model and effort persistence) |
 | `AGENT_REVIEW_MODEL` | `openai/gpt-6-luna` | reviewer model id for `auto` mode |
-| `AGENT_PERMISSION_MODE` | `default` | `default`\|`accept-edits`\|`plan`\|`auto`\|`yolo` (aliases: `ask`, `deny`, `approve-for-me`, …) |
-| `AGENT_EFFORT` | model default | reasoning effort level for `MODEL`, discovered per model (see above; aliases `MODEL_EFFORT`, `REASONING_EFFORT`, `EFFORT`) |
+| `AGENT_PERMISSION_MODE` | saved mode, else `default` | `default`\|`accept-edits`\|`plan`\|`auto`\|`yolo` (aliases: `ask`, `deny`, `approve-for-me`, …; CLI flags override) |
+| `AGENT_EFFORT` | saved effort, else model default | reasoning effort level for `MODEL`, discovered per model (see above; aliases `MODEL_EFFORT`, `REASONING_EFFORT`, `EFFORT`) |
+| `NADA_SETTINGS_FILE` | `~/.nada/settings.json` | file the selected model/effort/permission mode are saved to |
 | `AGENT_SESSION_DIR` | `~/.nada/sessions` | directory for saved sessions (alias `NADA_SESSION_DIR`; `--session-dir` overrides) |
 | `AGENT_MAX_TURNS` | `2000000` | max tool-calling turns per task |
 | `AGENT_MAX_RETRIES` | `5` | retries on HTTP 429 (rate limit) before giving up |

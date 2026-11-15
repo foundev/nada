@@ -72,6 +72,19 @@ def set_effort(effort, supported=None):
     EFFORT = validate_effort(effort, supported)
     return EFFORT
 
+def _check_model(model):
+    """A model id as a stripped string, raising ValueError if it is not a
+    plausible id (empty or containing whitespace)."""
+    if not isinstance(model, str) or not model.strip() or any(c.isspace() for c in model.strip()):
+        raise ValueError(f"invalid model id: {model!r}")
+    return model.strip()
+
+def set_model(model):
+    """Validate and set the session model; unchanged on failure."""
+    global MODEL
+    MODEL = _check_model(model)
+    return MODEL
+
 def parse_model_reasoning(model_data):
     """Reasoning info from an OpenRouter model object: supported_efforts
     (highest first; [] when the model exposes no effort selection),
@@ -1012,7 +1025,7 @@ def _read_line_raw(perms, in_buf, out, history=None, statusline=None):
                 del buf[cursor]; redraw()
             continue
         if b == b"\t":
-            perms.cycle_mode(1); redraw(); continue
+            perms.cycle_mode(1); persist_settings(permission_mode=perms.mode); redraw(); continue
         if b in (b"\x7f", b"\x08"):  # Backspace
             if cursor:
                 del buf[cursor - 1]; cursor -= 1; redraw()
@@ -1042,7 +1055,7 @@ def _read_line_raw(perms, in_buf, out, history=None, statusline=None):
                         break
                 direction = mode_switch_direction(seq)
                 if direction:
-                    perms.cycle_mode(direction); redraw(); continue
+                    perms.cycle_mode(direction); persist_settings(permission_mode=perms.mode); redraw(); continue
                 if seq == b"[A":  # up: history
                     if hist:
                         if hist_idx is None:
@@ -1275,13 +1288,18 @@ def parse_args(argv=None):
                         "(auto = reviewer-model approve-for-me; "
                         "aliases: ask, approve-edits, acceptEdits, deny, approve-for-me, "
                         "auto-review, bypass-permissions; "
-                        "default: $AGENT_PERMISSION_MODE or default)")
+                        "default: $AGENT_PERMISSION_MODE, else the saved mode; "
+                        "saved for the next run)")
+    p.add_argument("--model", dest="model", default=None, metavar="MODEL_ID",
+                   help="model id (default: $MODEL, else the model saved in "
+                        "~/.nada/settings.json, else meta/muse-ember); "
+                        "saved for the next run")
     p.add_argument("--effort", "--reasoning-effort", dest="effort", default=None,
                    metavar="LEVEL",
                    help="model reasoning effort level, discovered per-model from OpenRouter "
                         "(e.g. max|xhigh|high|medium|low|minimal for meta/muse-ember; "
                         "which levels exist depends on MODEL; 'default' = model default; "
-                        "default: $AGENT_EFFORT)")
+                        "default: $AGENT_EFFORT, else the saved effort; saved for the next run)")
     p.add_argument("--accept-edits", action="store_true",
                    help="auto-approve file edits; shell commands still prompt")
     p.add_argument("--plan", action="store_true",
@@ -1559,7 +1577,8 @@ def handle_permissions_command(parts, perms=None):
                   "(aliases: ask, approve-edits, acceptEdits, deny, approve-for-me, bypass-permissions)")
             print("       /permissions [default|accept-edits|plan|auto|yolo|clear]")
         else:
-            print(f"✓ Permissions mode: {mode} ({perms.describe()})")
+            persist_settings(permission_mode=perms.mode)
+            print(f"✓ Permissions mode: {mode} ({perms.describe()}) (saved for next run)")
 
 # /mode is the Claude-style spelling; /permissions keeps its allowlist/clear.
 handle_mode_command = handle_permissions_command
@@ -1584,7 +1603,8 @@ def handle_effort_command(parts):
         return
     if normalize_effort(parts[1]) is None:
         set_effort(None)
-        print(f"✓ Effort cleared: model default for {MODEL}")
+        persist_settings()
+        print(f"✓ Effort cleared: model default for {MODEL} (saved for next run)")
         return
     try:
         supported = discover_efforts()
@@ -1597,7 +1617,39 @@ def handle_effort_command(parts):
     except ValueError as e:
         print(f"{_red('✗')} Invalid effort: {e}  (usage: /effort [LEVEL|clear])")
         return
-    print(f"✓ Effort set: {level} for {MODEL}")
+    persist_settings()
+    print(f"✓ Effort set: {level} for {MODEL} (saved for next run)")
+
+def handle_model_command(parts):
+    """Handle `/model`: show the current model; `/model ID` sets it (and
+    saves it, plus the effort in force, for the next run). Effort levels
+    are per-model, so if the new model does not offer the current effort
+    it is cleared (with a note); if discovery fails the effort is kept
+    and OpenRouter judges."""
+    if len(parts) == 1:
+        print(f"Model: {MODEL}")
+        print("Usage: /model MODEL_ID   (e.g. openai/gpt-5.2)")
+        return
+    if len(parts) != 2:
+        print("Usage: /model MODEL_ID   (no argument shows the current model)")
+        return
+    try:
+        model = set_model(parts[1])
+    except ValueError as e:
+        print(f"{_red('✗')} Invalid model: {e}  (usage: /model MODEL_ID)")
+        return
+    if EFFORT is not None:
+        try:
+            supported = discover_efforts(model)
+        except Exception as e:  # offline etc.: keep effort, gateway judges
+            print(f"{_yellow('⚠')} Warning: could not discover effort levels for {model} ({e}); "
+                  "keeping current effort")
+        else:
+            if EFFORT not in supported:
+                print(f"Note: effort {EFFORT!r} is not supported by {model}; cleared to model default")
+                set_effort(None)
+    persist_settings()
+    print(f"✓ Model set: {model} (saved for next run)")
 
 HELP_TEXT = """Commands:
   /help                         show this help
@@ -1606,6 +1658,7 @@ HELP_TEXT = """Commands:
   /mode [MODE]                  permission mode (default|accept-edits|plan|auto|yolo)
   /permissions [MODE|clear]     mode, or show/clear the session allowlist
   /effort [LEVEL|clear]         model reasoning effort (no argument lists levels)
+  /model [MODEL_ID]             model (no argument shows the current one)
   /session [save [TITLE]|list|resume ID|new|delete ID|path]  (aliases: /sessions, /resume ID)
   /clear                        start a fresh conversation
   /quit                         exit
@@ -1660,6 +1713,155 @@ def handle_status_command(session=None, reasoning=_UNSET):
             print(f"{_yellow('⚠')} Warning: could not discover effort levels for {MODEL} ({e})")
             reasoning = None
     print(format_status(session, reasoning))
+
+# --- Persistent settings (model + effort + permission mode) ----------------
+# The last model/effort/permission mode selected in nada itself
+# (--model/--effort/--mode..., /model, /effort, /mode, Ctrl+Tab, or a
+# resumed session's model/effort) is remembered in ~/.nada/settings.json
+# (override with $NADA_SETTINGS_FILE) and reloaded on the next run, so a
+# fresh session starts with the same selection instead of the built-in
+# defaults. Explicit env vars ($MODEL / the effort vars /
+# $AGENT_PERMISSION_MODE) always override the saved values and are not
+# themselves saved -- they are already persistent in the environment.
+# A saved effort that the (possibly different) model does not support is
+# dropped with a warning at startup, not fatal (see main()). Note the
+# deliberate asymmetry with sessions: a *session* file still never
+# restores a permission mode (loading a file must not silently escalate),
+# but this settings file is your own recorded preference, so it does.
+
+SETTINGS_VERSION = 1
+_EFFORT_ENV_VARS = ("AGENT_EFFORT", "MODEL_EFFORT", "REASONING_EFFORT", "EFFORT")
+
+def default_settings_file():
+    """File persistent settings live in: $NADA_SETTINGS_FILE or
+    ~/.nada/settings.json."""
+    env = os.environ.get("NADA_SETTINGS_FILE")
+    if env:
+        return Path(env).expanduser()
+    try:
+        return Path.home() / ".nada" / "settings.json"
+    except Exception:
+        return Path.cwd() / ".nada" / "settings.json"
+
+def _validate_settings_data(data):
+    """Normalized {"model": ..., "effort": ..., "permission_mode": ...}
+    (None per field when unset) from raw data; an individually bad field
+    is dropped (None), not fatal."""
+    if not isinstance(data, dict):
+        raise ValueError("settings file must contain a JSON object")
+    if data.get("version") is not None and data.get("version") != SETTINGS_VERSION:
+        raise ValueError(f"unsupported settings version: {data.get('version')!r}")
+    model = data.get("model")
+    try:
+        model = _check_model(model) if model is not None else None
+    except ValueError:
+        model = None
+    try:
+        effort = validate_effort(data.get("effort"))
+    except ValueError:
+        effort = None
+    try:
+        mode = normalize_mode(data["permission_mode"]) if data.get("permission_mode") is not None else None
+    except ValueError:
+        mode = None
+    return {"model": model, "effort": effort, "permission_mode": mode}
+
+def load_settings(path=None):
+    """Saved {"model": ..., "effort": ..., "permission_mode": ...} (None
+    per field when unset), or {} when there is nothing usable -- a
+    missing/corrupt file is not fatal."""
+    path = Path(path).expanduser() if path else default_settings_file()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"{_yellow('⚠', stream=sys.stderr)} Warning: could not load saved settings {path} ({e}); "
+              "using defaults", file=sys.stderr)
+        return {}
+    try:
+        return _validate_settings_data(raw)
+    except ValueError as e:
+        print(f"{_yellow('⚠', stream=sys.stderr)} Warning: ignoring saved settings {path}: {e}",
+              file=sys.stderr)
+        return {}
+
+def save_settings(data, path=None):
+    """Validate and atomically write settings; returns the file path."""
+    data = data or {}
+    model = _check_model(data["model"]) if data.get("model") is not None else None
+    effort = validate_effort(data.get("effort"))
+    mode = normalize_mode(data["permission_mode"]) if data.get("permission_mode") is not None else None
+    payload = {"version": SETTINGS_VERSION, "model": model, "effort": effort,
+               "permission_mode": mode, "updated_at": _utcnow()}
+    path = Path(path).expanduser() if path else default_settings_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp, path)  # atomic: a crash never leaves a half-written file
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except TypeError:  # older Pythons: unlink() has no missing_ok
+            if tmp.exists():
+                tmp.unlink()
+    return path
+
+def persist_settings(path=None, *, permission_mode=None):
+    """Save the current MODEL/EFFORT (and permission mode) for the next
+    run; best-effort (a failure warns and returns False rather than
+    crashing the session). `permission_mode` defaults to the live
+    PERMS mode; pass it explicitly for a non-global Permissions object."""
+    try:
+        save_settings({"model": MODEL, "effort": EFFORT,
+                       "permission_mode": PERMS.mode if permission_mode is None else permission_mode},
+                      path=path)
+    except Exception as e:
+        print(f"{_yellow('⚠', stream=sys.stderr)} Warning: could not save settings ({e})",
+              file=sys.stderr)
+        return False
+    return True
+
+def resolve_selection(model_arg=None, effort_arg=None, saved=None):
+    """(model, effort, model_source, effort_source) for a run, by
+    precedence CLI > env > saved settings > built-in default. Sources are
+    "cli"/"env"/"saved"/"default" (main() uses them to decide what is
+    fatal vs fail-soft, and what to persist). Effort is normalized here;
+    per-model validation happens in main() after discovery."""
+    saved = saved or {}
+    if model_arg is not None:
+        model, model_source = _check_model(model_arg), "cli"
+    elif os.environ.get("MODEL", "").strip():
+        model, model_source = MODEL, "env"
+    elif saved.get("model"):
+        model, model_source = _check_model(saved["model"]), "saved"
+    else:
+        model, model_source = MODEL, "default"
+    if effort_arg is not None:
+        effort, effort_source = normalize_effort(effort_arg), "cli"
+    elif any(k in os.environ for k in _EFFORT_ENV_VARS):
+        effort, effort_source = EFFORT, "env"
+    elif saved.get("effort") is not None:
+        effort, effort_source = normalize_effort(saved["effort"]), "saved"
+    else:
+        effort, effort_source = EFFORT, "default"
+    return model, effort, model_source, effort_source
+
+def resolve_permission_mode(mode_arg=None, saved=None):
+    """(mode, source) for a run, by precedence CLI > env > saved
+    settings > current (the built-in default). `mode_arg` is the
+    canonical CLI-selected mode (--mode/--yes/--accept-edits/--plan) or
+    None. Unlike model/effort there is no "session" source: resuming a
+    session never restores a permission mode (see Session.restore())."""
+    if mode_arg is not None:
+        return normalize_mode(mode_arg), "cli"
+    if os.environ.get("AGENT_PERMISSION_MODE", "").strip():
+        return PERMS.mode, "env"
+    saved_mode = (saved or {}).get("permission_mode")
+    if saved_mode:
+        return normalize_mode(saved_mode), "saved"
+    return PERMS.mode, "default"
 
 # --- Sessions --------------------------------------------------------------
 # A session is the persisted conversation state: messages (stored verbatim,
@@ -1827,8 +2029,9 @@ class SessionStore:
 
 class Session:
     """Live session: messages/history for run_turns() plus metadata to
-    persist/restore them. PERMS/EFFORT go through the module globals, so a
-    restored session brings back its mode, allowlist, and effort too."""
+    persist/restore them. MODEL/EFFORT go through the module globals, so a
+    restored session brings back its model and effort too (but not its
+    permission mode/allowlist -- see restore())."""
 
     def __init__(self, store, *, session_id=None, title=None, messages=None, history=None):
         self.store = store
@@ -1852,7 +2055,9 @@ class Session:
         return {"version": SESSION_VERSION, "id": self.id,
                 "title": self.title or _derive_title(self.messages),
                 "created_at": self.created_at, "updated_at": self.updated_at,
-                "root": self.root, "model": self.model, "effort": EFFORT,
+                # Live MODEL, not self.model: /model may have changed it
+                # since this session was created/restored.
+                "root": self.root, "model": MODEL, "effort": EFFORT,
                 "permission_mode": PERMS.mode,
                 "allowlist": sorted([list(item) for item in PERMS.allowlist]),
                 "history": list(self.history),
@@ -1876,8 +2081,8 @@ class Session:
             return False
         return True
 
-    def restore(self, data, *, apply_effort=True, supported_efforts=None):
-        """Replace messages/history/effort with a saved session's. The
+    def restore(self, data, *, apply_model=True, apply_effort=True, supported_efforts=None):
+        """Replace messages/history/model/effort with a saved session's. The
         system prompt is regenerated for the current ROOT; a different
         originating root is reported, not fatal. Permission mode and
         allowlist are not restored (see below)."""
@@ -1885,7 +2090,13 @@ class Session:
         self.id, self.title = data["id"], data.get("title")
         self.created_at = data.get("created_at") or _utcnow()
         self.updated_at = data.get("updated_at") or self.created_at
-        self.root, self.model = data.get("root") or str(ROOT), data.get("model") or MODEL
+        self.root = data.get("root") or str(ROOT)
+        if apply_model and data.get("model"):
+            try:
+                set_model(data["model"])
+            except ValueError as e:
+                print(f"{_yellow('⚠')} Warning: saved model {data.get('model')!r} not applied ({e})")
+        self.model = MODEL
         messages = [dict(m) for m in data["messages"]]
         if messages and messages[0].get("role") == "system":
             messages[0] = {"role": "system", "content": build_system_prompt()}
@@ -1962,6 +2173,8 @@ def handle_session_command(parts, session):
             print(f"{_red('✗')} Could not resume session {target}: {e}")
         else:
             session.restore(data)
+            # A resumed session's model/effort become the next-run defaults.
+            persist_settings()
             print(f"✓ Resumed session: {session.id} ({session.turns} turns)")
     elif sub == "delete":
         if not args:
@@ -1991,20 +2204,50 @@ def main():
         VERBOSE = True
     if _PERM_ERROR and not (args.yes or args.permission_mode or args.accept_edits or args.plan):
         sys.exit(f"error: {_PERM_ERROR}")
+    _cli_mode = None
     if args.accept_edits:
-        PERMS.set_mode("accept-edits")
+        _cli_mode = "accept-edits"
     elif args.plan:
-        PERMS.set_mode("plan")
+        _cli_mode = "plan"
     if args.yes:
-        PERMS.set_mode("yolo")
+        _cli_mode = "yolo"
     elif args.permission_mode:
-        PERMS.set_mode(args.permission_mode)
-    if args.effort is not None:
-        try:
-            set_effort(args.effort)  # validated against the discovered levels below
-        except ValueError as e:
-            sys.exit(f"error: {e}")
+        _cli_mode = normalize_mode(args.permission_mode)
+    # Model/effort/permission mode for this run: CLI > env > saved
+    # settings > built-in default (effort is validated per-model after
+    # discovery, below). A saved permission mode is your own recorded
+    # preference, so it applies -- unlike a session's, which restore()
+    # deliberately never applies.
+    saved_settings = load_settings()
+    _mode, _mode_source = resolve_permission_mode(_cli_mode, saved_settings)
+    PERMS.set_mode(_mode)
+    try:
+        _model, _effort, _model_source, _effort_source = resolve_selection(
+            args.model, args.effort, saved_settings)
+        set_model(_model)
+        set_effort(_effort)
+    except ValueError as e:
+        sys.exit(f"error: {e}")
     if not API_KEY: sys.exit("set OPENROUTER_API_KEY (and optionally MODEL)")
+    store = SessionStore(args.session_dir)
+    session = Session(store)
+    session.autosave = not args.no_autosave
+    if args.session or args.continue_session:
+        target = args.session or "latest"
+        try:
+            data = store.load(target)
+        except FileNotFoundError:
+            sys.exit(f"error: session not found: {target} (dir: {store.dir})")
+        except Exception as e:
+            sys.exit(f"error: could not load session {target}: {e}")
+        # CLI --model/--effort override the session; otherwise the
+        # session's saved model/effort win over env/saved settings.
+        session.restore(data, apply_model=args.model is None, apply_effort=args.effort is None)
+        if args.model is None and data.get("model") and MODEL == str(data["model"]).strip():
+            _model_source = "session"
+        if args.effort is None and "effort" in data and EFFORT == normalize_effort(data.get("effort")):
+            _effort_source = "session"
+        print(f"✓ Resumed session: {session.id} ({session.turns} turns)")
     # Discover this model's effort levels from OpenRouter (best-effort: a
     # network failure only loses local validation, not the session).
     try:
@@ -2017,21 +2260,21 @@ def main():
         try:
             validate_effort(EFFORT, _reasoning["supported_efforts"] if _reasoning else None)
         except ValueError as e:
-            sys.exit(f"error: {e}")
-    store = SessionStore(args.session_dir)
-    session = Session(store)
-    session.autosave = not args.no_autosave
-    if args.session or args.continue_session:
-        target = args.session or "latest"
-        try:
-            data = store.load(target)
-        except FileNotFoundError:
-            sys.exit(f"error: session not found: {target} (dir: {store.dir})")
-        except Exception as e:
-            sys.exit(f"error: could not load session {target}: {e}")
-        session.restore(data, apply_effort=args.effort is None,
-                        supported_efforts=_reasoning["supported_efforts"] if _reasoning else None)
-        print(f"✓ Resumed session: {session.id} ({session.turns} turns)")
+            if _effort_source in {"saved", "session"}:
+                # A remembered effort the model no longer offers: drop it
+                # (and remember the drop), don't fail the whole run.
+                print(f"{_yellow('⚠', stream=sys.stderr)} Warning: saved effort {EFFORT!r} not supported by {MODEL} "
+                      f"({e}); using model default", file=sys.stderr)
+                set_effort(None)
+                persist_settings()  # remember the drop, don't warn again next run
+            else:
+                sys.exit(f"error: {e}")
+    # Selections made in nada itself (CLI flags / a resumed session's
+    # model+effort) become the defaults for the next run; env vars are
+    # not saved. (A resumed session contributes no permission mode.)
+    if (_model_source in {"cli", "session"} or _effort_source in {"cli", "session"}
+            or _mode_source == "cli"):
+        persist_settings()
     if args.task:
         session.messages.append({"role": "user", "content": " ".join(args.task)})
         try:
@@ -2064,6 +2307,8 @@ def main():
             handle_permissions_command(task.split()); continue
         if task.split() and task.split()[0] == "/effort":
             handle_effort_command(task.split()); continue
+        if task.split() and task.split()[0] == "/model":
+            handle_model_command(task.split()); continue
         if task.split() and task.split()[0] in {"/session", "/sessions", "/resume"}:
             handle_session_command(task.split(), session); continue
         if task:

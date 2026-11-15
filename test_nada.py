@@ -199,15 +199,22 @@ class TestPermissions(unittest.TestCase):
     def test_mode_command(self):
         p = perms("default")
         out = io.StringIO()
-        with patch.object(nada, "PERMS", p), patch("sys.stdout", out):
-            nada.handle_permissions_command(["/mode", "approve-edits"])
-            self.assertEqual(p.mode, "accept-edits")
-            nada.handle_permissions_command(["/permissions", "deny"])
-            self.assertEqual(p.mode, "plan")
-            nada.handle_permissions_command(["/mode", "bogus"])
-            self.assertEqual(p.mode, "plan")
-            nada.handle_permissions_command(["/permissions", "clear"])
-            nada.handle_permissions_command(["/mode"])
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = os.path.join(tmp, "settings.json")
+            with patch.dict(os.environ, {"NADA_SETTINGS_FILE": settings}), \
+                 patch.object(nada, "PERMS", p), patch("sys.stdout", out):
+                nada.handle_permissions_command(["/mode", "approve-edits"])
+                self.assertEqual(p.mode, "accept-edits")
+                self.assertEqual(nada.load_settings(settings)["permission_mode"],
+                                 "accept-edits")  # saved for next run
+                nada.handle_permissions_command(["/permissions", "deny"])
+                self.assertEqual(p.mode, "plan")
+                self.assertEqual(nada.load_settings(settings)["permission_mode"], "plan")
+                nada.handle_permissions_command(["/mode", "bogus"])
+                self.assertEqual(p.mode, "plan")  # unchanged, not re-saved
+                self.assertEqual(nada.load_settings(settings)["permission_mode"], "plan")
+                nada.handle_permissions_command(["/permissions", "clear"])
+                nada.handle_permissions_command(["/mode"])
         self.assertIn("accept-edits", out.getvalue())
 
 
@@ -223,13 +230,23 @@ class TestModeSwitchKeys(unittest.TestCase):
     def _read(self, data, mode="default", history=None):
         p = perms(mode)
         out = io.StringIO()
-        line = nada._read_line_raw(p, io.BytesIO(data), out, history)
+        with tempfile.TemporaryDirectory() as tmp:  # keep cycle-persistence off the real file
+            with patch.dict(os.environ, {"NADA_SETTINGS_FILE": os.path.join(tmp, "settings.json")}):
+                line = nada._read_line_raw(p, io.BytesIO(data), out, history)
         return line, p.mode, out.getvalue()
 
     def test_ctrl_tab_cycles_and_keeps_text(self):
         line, mode, out = self._read(b"\x1b[27;5;9~hello\r")
         self.assertEqual((line, mode), ("hello", "accept-edits"))
         self.assertIn("[accept-edits] > ", out)  # prompt redrawn with new mode
+
+    def test_ctrl_tab_cycle_saves_mode_for_next_run(self):
+        p = perms("default")
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = os.path.join(tmp, "settings.json")
+            with patch.dict(os.environ, {"NADA_SETTINGS_FILE": settings}):
+                nada._read_line_raw(p, io.BytesIO(b"\x1b[27;6;9~x\r"), io.StringIO())
+            self.assertEqual(nada.load_settings(settings)["permission_mode"], "yolo")
 
     def test_shift_tab_and_plain_tab_cycle_forward(self):
         self.assertEqual(self._read(b"\x1b[Zx\r")[1], "accept-edits")
@@ -671,6 +688,57 @@ class TestModelEffort(unittest.TestCase):
             nada.set_effort("max", ["high"])
         self.assertEqual(nada.EFFORT, "high")
 
+    def test_set_model(self):
+        original = nada.MODEL
+        self.addCleanup(lambda: nada.set_model(original))
+        self.assertEqual(nada.set_model("  openai/gpt-5.2 "), "openai/gpt-5.2")
+        for bad in ["", "   ", "a b", None, 42]:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                nada.set_model(bad)
+        self.assertEqual(nada.MODEL, "openai/gpt-5.2")  # unchanged on failure
+
+    def test_model_command(self):
+        original = nada.MODEL
+        self.addCleanup(lambda: nada.set_model(original))
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = os.path.join(tmp, "nested", "settings.json")
+            out = io.StringIO()
+            with patch.dict(os.environ, {"NADA_SETTINGS_FILE": settings}), \
+                 patch.object(nada, "discover_efforts", lambda model=None: ["high", "low"]), \
+                 patch("sys.stdout", out):
+                nada.handle_model_command(["/model"])
+                self.assertIn(f"Model: {original}", out.getvalue())
+                nada.set_effort("high")
+                nada.handle_model_command(["/model", "openai/gpt-5.2"])
+                self.assertEqual(nada.MODEL, "openai/gpt-5.2")
+                self.assertEqual(nada.EFFORT, "high")  # offered by new model: kept
+                saved = nada.load_settings(settings)
+                self.assertEqual((saved["model"], saved["effort"]),
+                                 ("openai/gpt-5.2", "high"))  # saved
+                nada.set_effort("max")
+                nada.handle_model_command(["/model", "other/model"])
+                self.assertIsNone(nada.EFFORT)  # not offered by other/model: cleared
+                nada.handle_model_command(["/model", "not a model"])
+                self.assertEqual(nada.MODEL, "other/model")  # unchanged on failure
+                nada.handle_model_command(["/model", "a", "b"])
+                self.assertIn("Usage: /model", out.getvalue())
+            text = out.getvalue()
+            self.assertIn("Model set: openai/gpt-5.2", text)
+            self.assertIn("not supported", text)
+
+    def test_model_command_keeps_effort_when_discovery_fails(self):
+        original = nada.MODEL
+        self.addCleanup(lambda: nada.set_model(original))
+
+        def boom(model=None):
+            raise RuntimeError("offline")
+        with patch.object(nada, "discover_efforts", boom), \
+             patch.object(nada, "persist_settings", lambda path=None: True), \
+             patch("sys.stdout", io.StringIO()):
+            nada.set_effort("high")
+            nada.handle_model_command(["/model", "other/model"])
+        self.assertEqual(nada.EFFORT, "high")  # kept: OpenRouter judges
+
     def test_discover_efforts_from_openrouter(self):
         seen = []
 
@@ -720,21 +788,191 @@ class TestModelEffort(unittest.TestCase):
 
     def test_effort_command(self):
         out = io.StringIO()
-        with patch.object(nada, "discover_efforts", lambda: ["max", "high", "low"]), \
-             patch.object(nada, "fetch_model_reasoning", lambda: nada.parse_model_reasoning(
-                 {"reasoning": {"supported_efforts": ["max", "high", "low"], "default_effort": "max"}})), \
-             patch("sys.stdout", out):
-            nada.handle_effort_command(["/effort"])
-            nada.handle_effort_command(["/effort", "HIGH"])
-            self.assertEqual(nada.EFFORT, "high")
-            nada.handle_effort_command(["/effort", "minimal"])  # not offered by this model
-            self.assertEqual(nada.EFFORT, "high")               # unchanged
-            nada.handle_effort_command(["/effort", "clear"])
-            self.assertIsNone(nada.EFFORT)
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = os.path.join(tmp, "settings.json")
+            with patch.dict(os.environ, {"NADA_SETTINGS_FILE": settings}), \
+                 patch.object(nada, "discover_efforts", lambda: ["max", "high", "low"]), \
+                 patch.object(nada, "fetch_model_reasoning", lambda: nada.parse_model_reasoning(
+                     {"reasoning": {"supported_efforts": ["max", "high", "low"], "default_effort": "max"}})), \
+                 patch("sys.stdout", out):
+                nada.handle_effort_command(["/effort"])
+                nada.handle_effort_command(["/effort", "HIGH"])
+                self.assertEqual(nada.EFFORT, "high")
+                self.assertEqual(nada.load_settings()["effort"], "high")  # saved
+                nada.handle_effort_command(["/effort", "minimal"])  # not offered by this model
+                self.assertEqual(nada.EFFORT, "high")               # unchanged
+                nada.handle_effort_command(["/effort", "clear"])
+                self.assertIsNone(nada.EFFORT)
+                self.assertIsNone(nada.load_settings()["effort"])  # clear is saved too
         text = out.getvalue()
         self.assertIn("max", text)
         self.assertIn("Effort set: high", text)
         self.assertIn("Invalid effort", text)
+
+
+class TestPersistentSettings(unittest.TestCase):
+    """~/.nada/settings.json: the last model/effort/permission mode
+    selected in nada is reloaded on the next run (CLI > env > saved >
+    default)."""
+
+    def test_default_settings_file_env(self):
+        with patch.dict(os.environ, {"NADA_SETTINGS_FILE": "/tmp/my-settings.json"}):
+            self.assertEqual(str(nada.default_settings_file()), "/tmp/my-settings.json")
+
+    def test_save_and_load_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "nested", "settings.json")  # parents created
+            nada.save_settings({"model": "openai/gpt-5.2", "effort": "HIGH",
+                                "permission_mode": "approve-edits"}, path=path)
+            self.assertEqual(nada.load_settings(path),
+                             {"model": "openai/gpt-5.2", "effort": "high",
+                              "permission_mode": "accept-edits"})  # alias canonicalized
+            with open(path) as f:
+                raw = json.load(f)
+            self.assertEqual(raw["version"], nada.SETTINGS_VERSION)
+            self.assertEqual(os.listdir(os.path.join(tmp, "nested")),
+                             ["settings.json"])  # no tmp left
+
+    def test_load_missing_or_corrupt_is_not_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(nada.load_settings(os.path.join(tmp, "absent.json")), {})
+            bad = os.path.join(tmp, "bad.json")
+            with open(bad, "w") as f:
+                f.write("not json")
+            self.assertEqual(nada.load_settings(bad), {})
+            with open(bad, "w") as f:
+                f.write('{"version": 999, "model": "x/y"}')
+            self.assertEqual(nada.load_settings(bad), {})
+
+    def test_load_drops_invalid_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "settings.json")
+            with open(path, "w") as f:
+                json.dump({"version": 1, "model": "not a model", "effort": "banana",
+                           "permission_mode": "sometimes"}, f)
+            self.assertEqual(nada.load_settings(path),
+                             {"model": None, "effort": None, "permission_mode": None})
+
+    def test_persist_settings_saves_current_model_and_effort(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "settings.json")
+            with patch.object(nada, "MODEL", "openai/gpt-5.2"), \
+                 patch.object(nada, "EFFORT", "low"), \
+                 patch.object(nada, "PERMS", perms("yolo")):
+                self.assertTrue(nada.persist_settings(path))
+            self.assertEqual(nada.load_settings(path),
+                             {"model": "openai/gpt-5.2", "effort": "low",
+                              "permission_mode": "yolo"})
+            # A failure (path is a directory) warns and returns False, no raise.
+            with patch("sys.stderr", io.StringIO()):
+                self.assertFalse(nada.persist_settings(tmp))
+
+    def test_save_settings_rejects_invalid_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "settings.json")
+            with self.assertRaises(ValueError):
+                nada.save_settings({"model": "a b"}, path=path)
+            with self.assertRaises(ValueError):
+                nada.save_settings({"effort": "banana"}, path=path)
+            with self.assertRaises(ValueError):
+                nada.save_settings({"permission_mode": "sometimes"}, path=path)
+            self.assertFalse(os.path.exists(path))
+
+    def test_resolve_selection_precedence(self):
+        saved = {"model": "saved/model", "effort": "low"}
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in {"MODEL", *nada._EFFORT_ENV_VARS}}
+        with patch.dict(os.environ, clean, clear=True), \
+             patch.object(nada, "MODEL", "default/model"), \
+             patch.object(nada, "EFFORT", None):
+            # saved beats the built-in default
+            self.assertEqual(nada.resolve_selection(None, None, saved),
+                             ("saved/model", "low", "saved", "saved"))
+            # CLI beats saved
+            self.assertEqual(nada.resolve_selection("cli/model", "high", saved),
+                             ("cli/model", "high", "cli", "cli"))
+            # nothing saved: built-in defaults
+            self.assertEqual(nada.resolve_selection(None, None, {}),
+                             ("default/model", None, "default", "default"))
+        with patch.dict(os.environ, {"MODEL": "env/model", "AGENT_EFFORT": "max"}), \
+             patch.object(nada, "MODEL", "env/model"), \
+             patch.object(nada, "EFFORT", "max"):
+            # env beats saved, but CLI still beats env
+            self.assertEqual(nada.resolve_selection(None, None, saved),
+                             ("env/model", "max", "env", "env"))
+            self.assertEqual(nada.resolve_selection("cli/model", None, saved),
+                             ("cli/model", "max", "cli", "env"))
+
+    def test_resolve_permission_mode_precedence(self):
+        saved = {"permission_mode": "plan"}
+        p = perms("default")
+        with patch.dict(os.environ, {}, clear=True), patch.object(nada, "PERMS", p):
+            self.assertEqual(nada.resolve_permission_mode(None, saved), ("plan", "saved"))
+            self.assertEqual(nada.resolve_permission_mode("yolo", saved), ("yolo", "cli"))
+            self.assertEqual(nada.resolve_permission_mode(None, {}), ("default", "default"))
+        p = perms("auto")
+        with patch.dict(os.environ, {"AGENT_PERMISSION_MODE": "auto"}), patch.object(nada, "PERMS", p):
+            self.assertEqual(nada.resolve_permission_mode(None, saved), ("auto", "env"))
+            self.assertEqual(nada.resolve_permission_mode("plan", saved), ("plan", "cli"))
+
+    def test_main_loads_saved_settings_and_persists_cli_selection(self):
+        original_model, original_effort = nada.MODEL, nada.EFFORT
+        self.addCleanup(lambda: (nada.set_model(original_model),
+                                 nada.set_effort(original_effort)))
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in {"MODEL", "AGENT_PERMISSION_MODE", *nada._EFFORT_ENV_VARS}}
+        reasoning = nada.parse_model_reasoning(
+            {"reasoning": {"supported_efforts": ["high", "low"]}})
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = os.path.join(tmp, "settings.json")
+            nada.save_settings({"model": "saved/model", "effort": "low",
+                                "permission_mode": "plan"}, path=settings)
+            env = {**clean, "NADA_SETTINGS_FILE": settings}
+            p = perms("default")
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(nada, "API_KEY", "test-key"), \
+                 patch.object(nada, "PERMS", p), \
+                 patch.object(nada, "fetch_model_reasoning", lambda: reasoning), \
+                 patch.object(nada, "run_turns", lambda messages: None), \
+                 patch("sys.argv",
+                       ["nada.py", "--session-dir", os.path.join(tmp, "sessions"), "hi"]):
+                nada.main()  # no CLI selection: saved settings are loaded
+            self.assertEqual((nada.MODEL, nada.EFFORT, p.mode), ("saved/model", "low", "plan"))
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(nada, "API_KEY", "test-key"), \
+                 patch.object(nada, "PERMS", p), \
+                 patch.object(nada, "fetch_model_reasoning", lambda: reasoning), \
+                 patch.object(nada, "run_turns", lambda messages: None), \
+                 patch("sys.argv",
+                       ["nada.py", "--model", "cli/model", "--effort", "high", "--accept-edits",
+                        "--session-dir", os.path.join(tmp, "sessions"), "hi"]):
+                nada.main()  # CLI selection wins and is saved for next time
+            self.assertEqual((nada.MODEL, nada.EFFORT, p.mode), ("cli/model", "high", "accept-edits"))
+            self.assertEqual(nada.load_settings(settings),
+                             {"model": "cli/model", "effort": "high",
+                              "permission_mode": "accept-edits"})
+
+    def test_main_drops_unsupported_saved_effort_and_remembers(self):
+        original_model, original_effort = nada.MODEL, nada.EFFORT
+        self.addCleanup(lambda: (nada.set_model(original_model),
+                                 nada.set_effort(original_effort)))
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in {"MODEL", *nada._EFFORT_ENV_VARS}}
+        reasoning = nada.parse_model_reasoning(
+            {"reasoning": {"supported_efforts": ["low"]}})  # saved "max" not offered
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = os.path.join(tmp, "settings.json")
+            nada.save_settings({"model": "saved/model", "effort": "max"}, path=settings)
+            with patch.dict(os.environ, {**clean, "NADA_SETTINGS_FILE": settings}, clear=True), \
+                 patch.object(nada, "API_KEY", "test-key"), \
+                 patch.object(nada, "fetch_model_reasoning", lambda: reasoning), \
+                 patch.object(nada, "run_turns", lambda messages: None), \
+                 patch("sys.argv",
+                       ["nada.py", "--session-dir", os.path.join(tmp, "sessions"), "hi"]), \
+                 patch("sys.stderr", io.StringIO()):
+                nada.main()  # must not exit: a remembered effort is fail-soft
+            self.assertEqual((nada.MODEL, nada.EFFORT), ("saved/model", None))
+            self.assertIsNone(nada.load_settings(settings)["effort"])  # drop remembered
 
 
 class TestSessions(unittest.TestCase):
@@ -845,16 +1083,38 @@ class TestSessions(unittest.TestCase):
         self.assertEqual(nada.PERMS.mode, "plan")       # ...not restored
         self.assertEqual(nada.PERMS.allowlist, set())    # ...not restored
 
+    def test_restore_applies_model_and_snapshot_uses_live_model(self):
+        original = nada.MODEL
+        self.addCleanup(lambda: nada.set_model(original))
+        nada.set_model("other/model")
+        s = self._session()
+        s.save()
+        self.assertEqual(self.store.load(s.id)["model"], "other/model")
+        nada.set_model("third/model")
+        restored = nada.Session(self.store)
+        with patch("sys.stdout", io.StringIO()):
+            restored.restore(self.store.load(s.id))
+        self.assertEqual(nada.MODEL, "other/model")  # saved model is applied
+        self.assertEqual(restored.model, "other/model")
+        nada.set_model("fourth/model")  # /model after restore...
+        self.assertEqual(restored.snapshot()["model"], "fourth/model")  # ...is what saves
+        with patch("sys.stdout", io.StringIO()):
+            restored.restore(self.store.load(s.id), apply_model=False)
+        self.assertEqual(nada.MODEL, "fourth/model")  # CLI --model wins over the session
+
     def test_session_command(self):
         s = self._session()
         s.save()
         other = nada.Session(self.store)
         out = io.StringIO()
-        with patch("sys.stdout", out):
+        settings = os.path.join(self._tmp.name, "settings.json")
+        with patch.dict(os.environ, {"NADA_SETTINGS_FILE": settings}), patch("sys.stdout", out):
             nada.handle_session_command(["/session", "list"], other)
             nada.handle_session_command(["/resume", s.id], other)
             nada.handle_session_command(["/session"], other)
             nada.handle_session_command(["/session", "resume", "missing"], other)
+        # Resuming saved the session's model/effort as the next-run defaults.
+        self.assertEqual(nada.load_settings(settings)["model"], nada.MODEL)
         self.assertEqual(other.turns, 1)  # resumed before the delete below
         with patch("sys.stdout", out):
             nada.handle_session_command(["/session", "delete", s.id], other)
@@ -911,6 +1171,11 @@ class TestParseArgs(unittest.TestCase):
 
         a = nada.parse_args(["--reasoning-effort", "low"])
         self.assertEqual(a.effort, "low")
+
+        a = nada.parse_args(["--model", "openai/gpt-5.2", "do", "it"])
+        self.assertEqual(a.model, "openai/gpt-5.2")
+        self.assertEqual(a.task, ["do", "it"])
+        self.assertIsNone(nada.parse_args([]).model)
 
 
 class TestTerminalUI(unittest.TestCase):
@@ -1135,10 +1400,12 @@ class TestTerminalUI(unittest.TestCase):
     def test_read_line_raw_statusline_refreshes_on_mode_cycle(self):
         p = perms("default")
         out = self._Tty()
-        with patch.dict(os.environ, {"TERM": "xterm"}):
-            line = nada._read_line_raw(
-                p, io.BytesIO(b"\x1b[27;5;9~x\r"), out,
-                statusline=lambda: f"mode={p.mode}")
+        with tempfile.TemporaryDirectory() as tmp:  # keep cycle-persistence off the real file
+            env = {"TERM": "xterm", "NADA_SETTINGS_FILE": os.path.join(tmp, "settings.json")}
+            with patch.dict(os.environ, env):
+                line = nada._read_line_raw(
+                    p, io.BytesIO(b"\x1b[27;5;9~x\r"), out,
+                    statusline=lambda: f"mode={p.mode}")
         self.assertEqual((line, p.mode), ("x", "accept-edits"))
         self.assertIn("mode=accept-edits", out.getvalue())
 
