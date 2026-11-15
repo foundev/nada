@@ -3,6 +3,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -420,6 +421,115 @@ class TestRunTurns(unittest.TestCase):
                                     perms("auto", reviewer=reviewer))
         self.assertEqual(calls, [])
         self.assertIn("auto-reviewer unavailable: model gone", messages[-2]["content"])
+
+
+class TestEscInterrupt(unittest.TestCase):
+    """Esc (or Ctrl-C) during a turn interrupts it and returns to the prompt."""
+
+    def tearDown(self):
+        nada._TURN_INTERRUPTED.clear()
+
+    def _listen(self, payloads):
+        """Run _listen_for_esc on a pipe, feeding `payloads`; returns
+        (interrupted.is_set(), [(pid, sig), ...])."""
+        r, w = os.pipe()
+        stop, interrupted = threading.Event(), threading.Event()
+        paused, ack = threading.Event(), threading.Event()
+        kills = []
+        t = threading.Thread(target=nada._listen_for_esc,
+                             args=(r, stop, interrupted, paused, ack),
+                             daemon=True)
+        t.start()
+        try:
+            with patch.object(nada.os, "kill",
+                             lambda pid, sig: kills.append((pid, sig))):
+                for p in payloads:
+                    os.write(w, p)
+                    time.sleep(0.15)  # let the listener drain each payload
+                t.join(timeout=2)
+        finally:
+            stop.set()
+            t.join(timeout=2)
+            os.close(r)
+            os.close(w)
+        return interrupted.is_set(), kills
+
+    def test_lone_esc_sets_interrupt_and_signals(self):
+        interrupted, kills = self._listen([b"\x1b"])
+        self.assertTrue(interrupted)
+        self.assertEqual(kills, [(os.getpid(), nada.signal.SIGINT)])
+
+    def test_escape_sequence_and_alt_key_are_not_an_interrupt(self):
+        # Up-arrow, then Alt+x, then a real lone Esc (which must still work,
+        # proving the earlier bytes were drained, not taken for an Esc).
+        interrupted, kills = self._listen([b"\x1b[A", b"\x1bx", b"\x1b"])
+        self.assertTrue(interrupted)
+        self.assertEqual(kills, [(os.getpid(), nada.signal.SIGINT)])
+
+    def test_other_keys_are_not_an_interrupt(self):
+        interrupted, kills = self._listen([b"hello\r"])
+        self.assertFalse(interrupted)
+        self.assertEqual(kills, [])
+
+    def test_run_turns_returns_to_prompt_when_model_is_interrupted(self):
+        def boom(messages):
+            raise KeyboardInterrupt
+        out = io.StringIO()
+        messages = [{"role": "system", "content": ""},
+                    {"role": "user", "content": "hi"}]
+        with patch.object(nada, "call_model", boom), patch("sys.stdout", out):
+            nada.run_turns(messages)  # must not raise
+        self.assertIn("Interrupted", out.getvalue())
+        self.assertEqual(messages[-1], {"role": "user", "content": "hi"})
+
+    def test_run_turns_trims_dangling_tool_calls_on_interrupt(self):
+        responses = iter([
+            {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "1", "function": {"name": "bash",
+                                          "arguments": '{"command": "make"}'}}]}}]},
+        ])
+        def boom(args):
+            raise KeyboardInterrupt
+        messages = [{"role": "system", "content": ""},
+                    {"role": "user", "content": "hi"}]
+        with patch.object(nada, "call_model", lambda m: next(responses)), \
+             patch.object(nada, "PERMS", perms("yolo")), \
+             patch.object(nada, "HANDLERS", {"bash": boom}), \
+             patch("sys.stdout", io.StringIO()):
+            nada.run_turns(messages)  # must not raise
+        # The assistant tool_calls message had no result: dropped, so the
+        # next API call gets no dangling tool_calls.
+        self.assertEqual(messages, [{"role": "system", "content": ""},
+                                    {"role": "user", "content": "hi"}])
+
+    def test_run_turns_aborts_before_the_next_tool_call(self):
+        calls = []
+        responses = iter([
+            {"choices": [{"message": {"content": "", "tool_calls": [
+                {"id": "1", "function": {"name": "bash", "arguments": "{}"}},
+                {"id": "2", "function": {"name": "bash", "arguments": "{}"}}]}}]},
+        ])
+        def first(args):
+            calls.append(args)
+            nada._TURN_INTERRUPTED.set()  # as if Esc was pressed mid-tool
+            return "ran"
+        messages = [{"role": "system", "content": ""},
+                    {"role": "user", "content": "hi"}]
+        with patch.object(nada, "call_model", lambda m: next(responses)), \
+             patch.object(nada, "PERMS", perms("yolo")), \
+             patch.object(nada, "HANDLERS", {"bash": first}), \
+             patch("sys.stdout", io.StringIO()):
+            nada.run_turns(messages)
+        self.assertEqual(len(calls), 1)  # second tool call never ran
+
+    def test_permission_prompt_lone_esc_interrupts(self):
+        with self.assertRaises(nada.TurnInterrupted):
+            perms("ask", ["\x1b"]).check("bash", {"command": "make build"})
+
+    def test_suspend_resume_without_a_listener_is_a_noop(self):
+        self.assertIsNone(nada._ACTIVE_ESC_LISTENER)
+        nada._suspend_esc_listener()
+        nada._resume_esc_listener()
 
 
 class TestCallModelRetries(unittest.TestCase):

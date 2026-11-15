@@ -47,7 +47,10 @@ alternate screen):
   pinned as a bar gets without a full TUI.) Without a tty there is no bar;
   in cooked-mode fallback it's printed above the prompt instead.
 - An animated `⠋ Working (2s)` spinner while the model or a long tool call
-  runs (tty only).
+  runs (tty only). Press **Esc** (or Ctrl-C) while a turn is running to
+  interrupt it and return to the prompt — the model/tool call is aborted
+  (a running `bash` command is killed) and any partial tool calls are
+  discarded, so the next turn starts clean.
 - Collapsed tool lines — `✓ Ran python3 -m unittest -v · 1.2s`,
   `✓ Edited nada.py`, `✓ Read nada.py · 1425 lines`, `✗ Ran make · exit 1` —
   with command output indented and dimmed underneath, capped at 12 lines

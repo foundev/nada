@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, difflib, json, os, random, re, select, shlex, shutil, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+import argparse, difflib, json, os, random, re, select, shlex, shutil, signal, subprocess, sys, threading, time, urllib.error, urllib.parse, urllib.request, uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -225,7 +225,8 @@ def trunc(s, n=30000):
 # on a tty the statusline is the mode's home, so the prompt drops its
 # `[mode]` label and only falls back to it when no statusline is drawn
 # (piped / dumb terminal). Then an animated `⠋ Working (2s)` spinner while
-# the model / a tool runs, and collapsed tool lines (`✓ Ran ... · 0.4s`
+# the model / a tool runs (Esc interrupts the turn, back to the prompt),
+# and collapsed tool lines (`✓ Ran ... · 0.4s`
 # with indented, dim output) instead of raw argument/result dumps. Colour
 # is tty-only (never with NO_COLOR / TERM=dumb), so piped output stays plain.
 
@@ -856,11 +857,20 @@ class Permissions:
         print("  2. Yes — always allow this exact command/path this session")
         print("  3. No — deny (the model will be told why)")
         while True:
+            # The Esc listener (active while a turn runs) reads stdin via
+            # os.read(), so it must pause -- and the terminal go back to
+            # cooked mode, echo included -- while input() owns stdin here,
+            # or it would steal the answer (and the answer would not echo).
+            _suspend_esc_listener()
             try:
                 ans = self._input("Allow? [y/a/n] ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print(f"\n{_red('✗')} [permission] denied (no input)")
                 return False
+            finally:
+                _resume_esc_listener()
+            if ans and set(ans) == {"\x1b"}:  # lone Esc typed at the prompt
+                raise TurnInterrupted
             if ans in {"y", "yes", "1"}:
                 return True
             if ans in {"a", "always", "2"}:
@@ -1117,6 +1127,143 @@ def read_repl_line(perms, history=None, statusline=None):
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
+# --- Esc to interrupt a turn -------------------------------------------------
+# While a turn runs (model call, reviewer call, tool execution) the REPL
+# prompt is closed, so a lone Esc -- like Ctrl-C in Claude Code / Codex --
+# interrupts the turn and returns to the prompt. Esc generates no signal,
+# so a daemon thread watches stdin in cbreak mode (chars delivered at once,
+# echo off, Ctrl-C still a signal) and, on a *lone* Esc, sends SIGINT to
+# this process. That is what actually unblocks the main thread: a blocking
+# urlopen()/subprocess.run()/sleep() is interrupted with KeyboardInterrupt
+# (stdin/stdout are not read by anyone else at that point -- the permission
+# prompt pauses this listener, see Permissions._ask). Arrow keys and other
+# escape sequences, and Alt+key, are drained and ignored -- only a lone Esc
+# counts. Without a tty there is no listener (and nothing to read); Ctrl-C
+# still interrupts via its signal. run_turns() contains the interrupt: it
+# trims any dangling tool_calls and returns, so the REPL is back at the
+# prompt and the next turn's API call is valid.
+
+class TurnInterrupted(KeyboardInterrupt):
+    """A turn was interrupted (Esc, or Ctrl-C surfacing there)."""
+
+_TURN_INTERRUPTED = threading.Event()  # set by the Esc listener mid-turn
+_ACTIVE_ESC_LISTENER = None            # the live _EscInterruptListener, if any
+
+def _listen_for_esc(fd, stop, interrupted, paused, paused_ack):
+    """Watch `fd` for a lone Esc; on one, set `interrupted` and SIGINT us.
+
+    `paused`/`paused_ack` let the permission prompt take over stdin: while
+    paused, nothing is read and `paused_ack` is set, so the caller knows
+    input() can safely own the fd. All reads are select()-guarded, so the
+    thread always notices `stop` within ~50ms."""
+    while not stop.is_set():
+        if paused.is_set():
+            paused_ack.set()
+            stop.wait(0.02)
+            continue
+        paused_ack.clear()
+        try:
+            if not select.select([fd], [], [], 0.05)[0]:
+                continue
+            if paused.is_set():  # a pause began while we were selecting
+                paused_ack.set()
+                continue
+            b = os.read(fd, 1)
+        except (OSError, ValueError):
+            return
+        if not b:
+            return
+        if b != b"\x1b":
+            continue  # any other key (incl. type-ahead) is not for us
+        try:
+            if select.select([fd], [], [], 0.05)[0]:
+                second = os.read(fd, 1)
+                if second in (b"[", b"O"):  # CSI/SS3 sequence (arrows, ...)
+                    while select.select([fd], [], [], 0.05)[0]:
+                        c = os.read(fd, 1)
+                        if not c or b"@" <= c <= b"~":  # final byte
+                            break
+                continue  # a sequence or Alt+key, not a lone Esc
+        except (OSError, ValueError):
+            return
+        interrupted.set()  # lone Esc
+        if not stop.is_set():
+            try:
+                os.kill(os.getpid(), signal.SIGINT)
+            except OSError:
+                pass
+        return
+
+class _EscInterruptListener:
+    """Context manager: cbreak stdin + Esc-watching thread for one turn.
+    A no-op without a tty / termios (piped stdin must never be consumed)."""
+
+    def __init__(self):
+        self.fd, self._old, self._thread = None, None, None
+        self._stop, self._paused, self._paused_ack = (
+            threading.Event(), threading.Event(), threading.Event())
+
+    def __enter__(self):
+        global _ACTIVE_ESC_LISTENER
+        if termios is None or not _is_tty():
+            return self
+        try:
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            # TCSADRAIN (not setcbreak's TCSAFLUSH): keep type-ahead input.
+            tty.setcbreak(fd, termios.TCSADRAIN)
+        except Exception:
+            return self
+        self.fd, self._old = fd, old
+        _ACTIVE_ESC_LISTENER = self
+        self._thread = threading.Thread(
+            target=_listen_for_esc,
+            args=(fd, self._stop, _TURN_INTERRUPTED, self._paused,
+                  self._paused_ack),
+            daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        global _ACTIVE_ESC_LISTENER
+        if self.fd is None:
+            return False
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        if _ACTIVE_ESC_LISTENER is self:
+            _ACTIVE_ESC_LISTENER = None
+        try:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self._old)
+        except Exception:
+            pass
+        self.fd = None
+        return False
+
+def _suspend_esc_listener():
+    """Pause the Esc listener and restore cooked mode (permission prompt)."""
+    listener = _ACTIVE_ESC_LISTENER
+    if listener is None or listener.fd is None:
+        return
+    listener._paused_ack.clear()
+    listener._paused.set()
+    listener._paused_ack.wait(timeout=1)
+    try:
+        termios.tcsetattr(listener.fd, termios.TCSADRAIN, listener._old)
+    except Exception:
+        pass
+
+def _resume_esc_listener():
+    """Re-apply cbreak mode and resume the Esc listener (after a prompt)."""
+    listener = _ACTIVE_ESC_LISTENER
+    if listener is None or listener.fd is None:
+        return
+    try:
+        tty.setcbreak(listener.fd, termios.TCSADRAIN)
+    except Exception:
+        pass
+    listener._paused.clear()
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(prog="nada.py", description="Minimal coding agent with permission prompts.")
     p.add_argument("--yes", "-y", "--auto-approve", action="store_true",
@@ -1309,11 +1456,30 @@ def _message_text(content):
     return str(content or "")
 
 def run_turns(messages):
+    """Run one user turn (model + tool calls), Esc/Ctrl-C interruptible.
+
+    A lone Esc (see _EscInterruptListener) or Ctrl-C interrupts the turn
+    wherever it is -- a blocking model/reviewer call, a 429 backoff sleep,
+    or a running tool (subprocess.run kills the child on the resulting
+    KeyboardInterrupt) -- and returns normally: any dangling tool_calls
+    are trimmed (so the next API call is valid) and the REPL is back at
+    its prompt. The interrupt never propagates out as KeyboardInterrupt."""
+    _TURN_INTERRUPTED.clear()
+    try:
+        with _EscInterruptListener():
+            _run_turns(messages)
+    except KeyboardInterrupt:
+        messages[:] = _trim_incomplete_tool_calls(messages)
+        print(f"\n{_yellow('⚠')} Interrupted — returning to the prompt")
+
+def _run_turns(messages):
     global _LAST_USAGE
     usage = {"prompt_tokens": 0, "completion_tokens": 0}
     printed_activity = False
     for _ in range(MAX_TURNS):
-        with Spinner("Working"):
+        if _TURN_INTERRUPTED.is_set():  # Esc landed where it was swallowed
+            raise TurnInterrupted        # (e.g. by a permission prompt)
+        with Spinner("Working · Esc to interrupt"):
             reply = call_model(messages)
         _add_usage(usage, reply.get("usage"))
         _LAST_USAGE = dict(usage)  # for the statusline bar at the next prompt
@@ -1331,6 +1497,8 @@ def run_turns(messages):
                 print(f"\n  {_dim(usage_line)}")
             return
         for call in calls:
+            if _TURN_INTERRUPTED.is_set():
+                raise TurnInterrupted
             fn = call["function"]; name = fn["name"]
             try:
                 args = json.loads(fn.get("arguments") or "{}")
@@ -1441,7 +1609,8 @@ HELP_TEXT = """Commands:
   /session [save [TITLE]|list|resume ID|new|delete ID|path]  (aliases: /sessions, /resume ID)
   /clear                        start a fresh conversation
   /quit                         exit
-At the prompt, Ctrl+Tab / Shift+Tab cycles permission modes."""
+At the prompt, Ctrl+Tab / Shift+Tab cycles permission modes.
+During a turn, Esc (or Ctrl-C) interrupts it and returns to the prompt."""
 
 def handle_help_command(parts=None):
     """Handle `/help`."""
