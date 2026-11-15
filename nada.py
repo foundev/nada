@@ -216,11 +216,18 @@ def trunc(s, n=30000):
     return s if len(s) <= n else s[:n] + f"\n... [truncated {len(s)-n} chars]"
 
 # --- Terminal UI (Codex-style) -------------------------------------------------
-# The TUI is line-based (stdlib only, no alternate screen): a boxed header, a
-# coloured `[mode] >` prompt, an animated `⠋ Working (2s)` spinner while the
-# model / a tool runs, and collapsed tool lines (`✓ Ran ... · 0.4s` with
-# indented, dim output) instead of raw argument/result dumps. Colour is
-# tty-only (never with NO_COLOR / TERM=dumb), so piped output stays plain.
+# The TUI is line-based (stdlib only, no alternate screen): a slim boxed
+# header at startup (brand, full root, AGENTS.md, help hint -- nothing the
+# statusline shows), a bare `> ` prompt, and a dim statusline bar under it
+# holding all live state (model, dir, mode, effort, session, turns, tokens
+# -- drawn by the raw line reader, so it lives only while a prompt is open;
+# output takes its line on submit). Each fact is shown in exactly one place:
+# on a tty the statusline is the mode's home, so the prompt drops its
+# `[mode]` label and only falls back to it when no statusline is drawn
+# (piped / dumb terminal). Then an animated `⠋ Working (2s)` spinner while
+# the model / a tool runs, and collapsed tool lines (`✓ Ran ... · 0.4s`
+# with indented, dim output) instead of raw argument/result dumps. Colour
+# is tty-only (never with NO_COLOR / TERM=dumb), so piped output stays plain.
 
 VERBOSE = os.environ.get("NADA_VERBOSE", "").lower() in {"1", "true", "yes", "on"}
 TOOL_OUTPUT_MAX_LINES = 12
@@ -259,6 +266,24 @@ def _terminal_width():
         return max(40, min(80, shutil.get_terminal_size((80, 24)).columns))
     except Exception:
         return 80
+
+def _full_terminal_width():
+    """Real terminal width (uncapped, unlike _terminal_width's 80 for the
+    banner): the statusline bar spans the whole terminal."""
+    try:
+        cols = shutil.get_terminal_size((80, 24)).columns
+        return cols if cols >= 20 else 80  # bogus/zero size (e.g. a fresh pty)
+    except Exception:
+        return 80
+
+def _statusline_enabled(stream=None):
+    """True if a statusline bar can be drawn on `stream`: a tty (cursor
+    movement needs one), but regardless of colour/`NO_COLOR`."""
+    stream = sys.stdout if stream is None else stream
+    try:
+        return bool(stream.isatty()) and os.environ.get("TERM") != "dumb"
+    except Exception:
+        return False
 
 def format_duration(seconds):
     """Human duration: 40ms, 1.2s, 2m 3s."""
@@ -343,6 +368,10 @@ def format_diff(old, new, path="", *, max_lines=DIFF_MAX_LINES):
         out = out[:max_lines] + [_dim(f"… {len(out) - max_lines} more diff lines")]
     return "\n".join(out)
 
+# Usage of the most recent run_turns() turn, so the statusline bar can show
+# the last turn's tokens at the next prompt (like the per-turn footer).
+_LAST_USAGE = {}
+
 def _usage_counts(usage):
     usage = usage or {}
     return (usage.get("prompt_tokens") or usage.get("input_tokens") or 0,
@@ -363,16 +392,21 @@ def _add_usage(total, usage):
 def format_banner(model=None, root=None, mode=None, effort=None,
                   session_id=None, session_path=None, agents=None, width=None):
     """The boxed Codex-style header shown at REPL startup (plain text when
-    not on a tty: the box is drawn either way, only colours change)."""
-    model = MODEL if model is None else model
+    not on a tty: the box is drawn either way, only colours change).
+
+    Deliberately slim: only what the statusline bar does not show -- the
+    brand, the full working-directory path (the bar shows just its basename),
+    AGENTS.md files loaded, and the help hint. Live state (model, mode,
+    effort, session, turns, tokens) lives in the statusline, so repeating
+    it here would show it twice at the first prompt. `model`/`mode`/
+    `effort`/`session_id`/`session_path` are accepted (and ignored) for
+    compatibility with earlier callers."""
     root = ROOT if root is None else root
-    mode = PERMS.mode if mode is None else mode
     width = width or _terminal_width()
     color = _use_color()
     lines = [
-        f"nada · {model}",
+        "nada",
         str(root),
-        f"{mode} · effort: {effort or '(model default)'} · session: {session_id or ''}",
     ]
     if agents:
         lines.append("AGENTS.md: " + ", ".join(agents))
@@ -386,6 +420,72 @@ def format_banner(model=None, root=None, mode=None, effort=None,
         box.append(f"│ {styled} │")
     box.append("╰" + "─" * (width - 2) + "╯")
     return "\n".join(box)
+
+def format_statusline(model=None, root=None, mode=None, effort=None,
+                      session_id=None, session=None, turns=None, usage=None,
+                      width=None, stream=None):
+    """One-line Codex-style statusline bar (the single home for live state):
+    `meta/muse-ember · nada · default · effort: max · session: s1 · 3 turns
+    · tokens: 1,234 in · 567 out` (dim, mode in its prompt colour -- the
+    prompt itself is a bare `> ` on a tty, so the mode appears only here).
+
+    Defaults come from the module globals (MODEL/ROOT/PERMS/EFFORT and the
+    last turn's usage); a `session` object supplies its id/turns. Segments
+    are dropped low-priority-first (usage, then turns, then session) so the
+    plain text never exceeds `width` (default: the full terminal width) --
+    model, directory, mode, and effort always survive. Drawn under the REPL
+    prompt by _read_line_raw() on a tty; piped output never sees it."""
+    model = MODEL if model is None else model
+    root = ROOT if root is None else root
+    mode = PERMS.mode if mode is None else mode
+    effort = EFFORT if effort is None else effort
+    if session is not None:
+        session_id = session_id or getattr(session, "id", None)
+        if turns is None:
+            turns = getattr(session, "turns", None)
+    usage = _LAST_USAGE if usage is None else usage
+    width = width or _full_terminal_width()
+    root_name = Path(str(root)).name or str(root)
+    segments = [str(model), root_name,
+                _ansi(str(mode), _MODE_COLORS.get(str(mode), "2"))
+                if _use_color(stream) else str(mode),
+                f"effort: {effort or '(model default)'}"]
+    optional = []
+    if session_id:
+        optional.append(f"session: {session_id}")
+    if turns:
+        optional.append(f"{turns} turn" + ("s" if turns != 1 else ""))
+    usage_line = format_usage(usage)
+    if usage_line:
+        optional.append(usage_line)
+    styled = [_dim(s, stream=stream) if i != 2 else s
+              for i, s in enumerate(segments)]
+    styled += [_dim(s, stream=stream) for s in optional]
+    joiner = _dim(" · ", stream=stream)
+    while optional and len(_strip_ansi(joiner.join(styled))) > width:
+        styled.pop()  # drop usage, then turns, then session
+        optional.pop()
+    text = joiner.join(styled)
+    # _one_line counts ANSI bytes, so only use it on plain text (coloured
+    # bars are already within width, modulo a too-long core segment).
+    if len(_strip_ansi(text)) > width:
+        text = _one_line(_strip_ansi(text), width)
+    return text
+
+def _resolve_statusline(statusline, perms, stream=None):
+    """Fresh statusline text for one prompt: a callable is called, a string
+    used as-is, None builds the default from the globals (mode from
+    `perms`, so a Ctrl+Tab cycle is reflected)."""
+    try:
+        if callable(statusline) or isinstance(statusline, str):
+            # Already width-limited (format_statusline) and possibly
+            # coloured: only enforce a single line, never _one_line it
+            # (that would count ANSI bytes towards the width).
+            text = statusline() if callable(statusline) else statusline
+            return re.sub(r"[\r\n]+", " ", str(text))
+        return format_statusline(mode=perms.mode, stream=stream)
+    except Exception:
+        return format_statusline(mode=perms.mode, stream=stream)
 
 def spinner_frame(i):
     return SPINNER_FRAMES[i % len(SPINNER_FRAMES)]
@@ -785,7 +885,8 @@ except ValueError as e:  # e.g. bad AGENT_PERMISSION_MODE; reported in main(), n
 #   Ctrl+Tab when the terminal cannot distinguish it from plain Tab arrives
 #   as Tab (0x09) -- the REPL has no tab-completion, so Tab cycles too.
 #   Ctrl+Shift+Tab / Shift+Ctrl+Tab (modifier 6/8) cycles backwards.
-# The prompt always shows the current mode, so a cycle is visible instantly.
+# The statusline always shows the current mode (the prompt only falls back
+# to `[mode]` when no statusline is drawn), so a cycle is visible instantly.
 
 def mode_switch_direction(seq):
     """+1/-1 if escape sequence `seq` (bytes after ESC, e.g. b'[Z') cycles
@@ -829,26 +930,50 @@ def _next_byte(in_buf, timeout=0.05):
         pass
     return in_buf.read(1) or None
 
-def _repl_prompt(perms, stream=None):
-    """`[mode] > ` -- the mode is colour-coded per mode on a tty
-    (plan=yellow, yolo=red, ...), plain text elsewhere."""
+def _repl_prompt(perms, stream=None, show_mode=False):
+    """`> ` -- a bare prompt; the permission mode lives in the statusline
+    bar drawn under it, not here. With `show_mode=True` (no statusline will
+    be drawn: piped / dumb terminal) the prompt instead carries the mode
+    as `[mode] > `, colour-coded per mode on a tty (plan=yellow, yolo=red,
+    ...), plain text elsewhere -- so the mode is still shown exactly once."""
+    if not show_mode:
+        return _ansi(">", "1") + " " if _use_color(stream) else "> "
     label = f"[{perms.mode}]"
     if _use_color(stream):
         return f"{_ansi(label, _MODE_COLORS.get(perms.mode, '2'))} {_ansi('>', '1')} "
     return f"{label} > "
 
-def _read_line_raw(perms, in_buf, out, history=None):
+def _read_line_raw(perms, in_buf, out, history=None, statusline=None):
     """Read one REPL line in raw mode (caller sets terminal raw mode).
 
     Handles Ctrl+Tab/Shift+Tab/Tab mode cycling, history (up/down), and
     basic editing (backspace/delete, Ctrl-U/W/A/E). Raises EOFError /
-    KeyboardInterrupt like input()."""
+    KeyboardInterrupt like input(). On a tty a statusline bar is drawn on
+    the line under the prompt (refreshed when the mode cycles, on submit
+    the output takes that line); off a tty it is not drawn at all."""
     buf, cursor = [], 0
     hist, hist_idx, saved = list(history or []), None, ""
+    show_status = _statusline_enabled(out)
+    status_cache = {"mode": None, "text": ""}
+
+    def status_text():
+        # Nothing else can change while a prompt is open, so cache the bar
+        # and rebuild it only when a mode cycle changes the mode.
+        if status_cache["mode"] != perms.mode:
+            status_cache["text"] = _resolve_statusline(statusline, perms, stream=out)
+            status_cache["mode"] = perms.mode
+        return status_cache["text"]
 
     def redraw():
-        prompt = _repl_prompt(perms, stream=out)
-        out.write("\r\x1b[K" + prompt + "".join(buf))
+        # Bare `> ` when the statusline under it carries the mode; the
+        # `[mode]` prompt only as a one-line fallback with no bar.
+        prompt = _repl_prompt(perms, stream=out, show_mode=not show_status)
+        line = prompt + "".join(buf)
+        out.write("\r\x1b[K" + line)
+        if show_status:
+            # Bar on the line under the prompt, then back up onto it; the
+            # cursor ends on the prompt line, after the typed text.
+            out.write("\r\n\x1b[K" + status_text() + "\x1b[1A\r" + line)
         if cursor < len(buf):
             out.write(f"\x1b[{len(buf) - cursor}D")
         out.flush()
@@ -858,13 +983,15 @@ def _read_line_raw(perms, in_buf, out, history=None):
         buf, cursor = list(text), len(text)
         redraw()
 
-    out.write(_repl_prompt(perms, stream=out)); out.flush()
+    redraw()
     while True:
         b = in_buf.read(1)
         if not b:
             raise EOFError
         if b in (b"\r", b"\n"):
-            out.write("\r\n"); out.flush()
+            # Cursor is on the prompt line; move onto the (now cleared)
+            # statusline line so the output below starts there.
+            out.write("\r\n\x1b[K" if show_status else "\r\n"); out.flush()
             return "".join(buf)
         if b == b"\x03":  # Ctrl-C
             raise KeyboardInterrupt
@@ -968,17 +1095,25 @@ class _FdReader:
     def fileno(self):
         return self.fd
 
-def read_repl_line(perms, history=None):
+def read_repl_line(perms, history=None, statusline=None):
     """Read a task line from the REPL, cycling permission modes on Ctrl+Tab.
 
-    Falls back to plain input() without a tty / termios (no cycling)."""
+    Falls back to plain input() without a tty / termios (no cycling); on a
+    tty stdout the statusline bar is then printed above the prompt instead
+    of under it, since cooked mode cannot draw under the input line -- and
+    the prompt stays bare, the bar carrying the mode. With no bar at all
+    (piped stdout) the input prompt falls back to `[mode] > `."""
     if termios is None or not _is_tty():
-        return input(_repl_prompt(perms))
+        status_shown = _statusline_enabled(sys.stdout)
+        if status_shown:
+            print(_resolve_statusline(statusline, perms))
+        return input(_repl_prompt(perms, show_mode=not status_shown))
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
-        return _read_line_raw(perms, _FdReader(fd), sys.stdout, history)
+        return _read_line_raw(perms, _FdReader(fd), sys.stdout, history,
+                              statusline=statusline)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
@@ -1174,12 +1309,14 @@ def _message_text(content):
     return str(content or "")
 
 def run_turns(messages):
+    global _LAST_USAGE
     usage = {"prompt_tokens": 0, "completion_tokens": 0}
     printed_activity = False
     for _ in range(MAX_TURNS):
         with Spinner("Working"):
             reply = call_model(messages)
         _add_usage(usage, reply.get("usage"))
+        _LAST_USAGE = dict(usage)  # for the statusline bar at the next prompt
         msg = reply["choices"][0]["message"]
         messages.append(msg)  # verbatim — required for tool_calls validation
         text = _message_text(msg.get("content"))
@@ -1734,14 +1871,15 @@ def main():
             session.try_save()
         return
     _agents = load_agents_instructions()
-    print(format_banner(model=MODEL, root=ROOT, mode=PERMS.mode,
-                        effort=EFFORT or "(model default)",
-                        session_id=session.id, session_path=session.path(),
+    # Banner is startup-only facts; model/mode/effort/session live in the
+    # statusline bar under the first prompt (effort detail in the line below).
+    print(format_banner(root=ROOT,
                         agents=[rel for rel, _ in _agents] or None))
     print(f"  {_dim(_effort_summary(_reasoning))}")
     while True:
         print()
-        try: task = read_repl_line(PERMS, session.history).strip()
+        try: task = read_repl_line(PERMS, session.history,
+                                   statusline=lambda: format_statusline(session=session)).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break

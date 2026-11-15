@@ -23,12 +23,29 @@ REPL commands: `/help`, `/status`, `/verbose [on|off]`, `/quit`, `/clear`,
 The REPL borrows Codex's look (still line-based and stdlib-only — no
 alternate screen):
 
-- A boxed header at startup with the model, working directory, permission
-  mode, effort, and session, plus an effort summary line below it.
-- A colour-coded prompt — `[mode] > `, with the mode in its own colour
-  (`plan` yellow, `yolo` red, `auto` cyan, `accept-edits` green). Colour is
-  tty-only: piped output and one-shot runs stay plain text, and `$NO_COLOR`
-  (or `--no-color`) disables it everywhere.
+- A slim boxed header at startup with only what the statusline doesn't show:
+  the `nada` name, the full working-directory path (the bar shows just its
+  basename), any `AGENTS.md` files loaded, and a help hint — plus an effort
+  summary line below it (the available effort levels, not just the current
+  one the bar shows).
+- A bare prompt — `> ` (bold on a tty). The permission mode lives in the
+  statusline below, not in the prompt; only with no statusline (piped /
+  dumb terminal) does the prompt carry it as `[mode] > `, with the mode in
+  its own colour (`plan` yellow, `yolo` red, `auto` cyan,
+  `accept-edits` green). Colour is tty-only: piped output and one-shot
+  runs stay plain text, and `$NO_COLOR` (or `--no-color`) disables it
+  everywhere.
+- A statusline bar on the line under the prompt, holding all live state —
+  `meta/muse-ember · nada · default · effort: max · session: s1 · 3 turns · tokens: 1,234 in · 567 out`
+  — the model, working directory, permission mode (in its colour, its only
+  appearance on a tty), effort, session, turn count, and the last turn's
+  token usage. It spans the full terminal width (low-priority segments are
+  dropped first on a
+  narrow terminal), refreshes instantly when Ctrl+Tab cycles the mode, and
+  is drawn only while a prompt is open — submitting clears it and the
+  output below takes its line. (Line-based, no alternate screen: that's as
+  pinned as a bar gets without a full TUI.) Without a tty there is no bar;
+  in cooked-mode fallback it's printed above the prompt instead.
 - An animated `⠋ Working (2s)` spinner while the model or a long tool call
   runs (tty only).
 - Collapsed tool lines — `✓ Ran python3 -m unittest -v · 1.2s`,
@@ -72,7 +89,8 @@ provably read-only `bash` commands never prompt, in any mode.
 ### Modes
 
 Claude-Code-style permission modes. The current mode is shown in the REPL
-prompt, e.g. `[accept-edits] > `, at startup, and by `/mode` / `/permissions`.
+statusline bar under the prompt (in the `[accept-edits] > ` prompt itself
+only when no statusline is drawn, e.g. piped), and by `/mode` / `/permissions`.
 
 | Mode | Behaviour |
 |------|-----------|
@@ -124,8 +142,8 @@ OpenRouter. `yolo` is the old behaviour of `auto`: no prompt, no review.
 
 At the REPL prompt, press **Ctrl+Tab** (or Shift+Tab) to cycle
 `default → accept-edits → plan → auto → yolo → default`; Ctrl+Shift+Tab cycles
-backwards. The prompt redraws with the new mode immediately, and any text
-you've typed is kept.
+backwards. The statusline redraws with the new mode immediately, and any
+text you've typed is kept.
 
 Terminals don't agree on a Ctrl+Tab encoding, so several are recognised
 (kitty/xterm `ESC[27;5;9~`-style sequences and Shift+Tab `ESC[Z`). Some
@@ -215,7 +233,7 @@ Sessions are **autosaved** after every REPL turn and after one-shot runs
 on exit. A session with no turns yet is never written.
 
 ```sh
-python3 nada.py                     # new session (id shown at startup)
+python3 nada.py                     # new session (id in the statusline)
 python3 nada.py --continue          # resume the most recently saved session
 python3 nada.py --session ID        # resume a specific session ('latest' also works)
 python3 nada.py --session ID "follow-up task"   # resume + one-shot task, then save

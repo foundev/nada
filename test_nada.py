@@ -893,25 +893,144 @@ class TestTerminalUI(unittest.TestCase):
                                            "content": "hello\n"})
         self.assertIn("+hello", out)
 
-    def test_repl_prompt_plain_off_tty_coloured_on_tty(self):
+    def test_repl_prompt_bare_by_default_mode_only_as_fallback(self):
         p = perms("plan")
-        self.assertEqual(nada._repl_prompt(p, stream=io.StringIO()), "[plan] > ")
+        # The mode lives in the statusline on a tty, so the prompt is bare.
+        self.assertEqual(nada._repl_prompt(p, stream=io.StringIO()), "> ")
         with patch.object(nada, "_use_color", lambda stream=None: True):
             coloured = nada._repl_prompt(p, stream=io.StringIO())
+        self.assertIn("\x1b[", coloured)
+        self.assertEqual(nada._strip_ansi(coloured), "> ")
+        # Only when no statusline will be drawn does the prompt carry it.
+        self.assertEqual(nada._repl_prompt(p, stream=io.StringIO(),
+                                           show_mode=True), "[plan] > ")
+        with patch.object(nada, "_use_color", lambda stream=None: True):
+            coloured = nada._repl_prompt(p, stream=io.StringIO(), show_mode=True)
         self.assertIn("\x1b[", coloured)
         self.assertEqual(nada._strip_ansi(coloured), "[plan] > ")
 
     def test_format_banner_is_a_box_of_the_given_width(self):
-        banner = nada.format_banner(model="m", root="/r", mode="auto", effort="high",
-                                    session_id="s1", session_path="/s/s1.json",
+        banner = nada.format_banner(model="meta/muse-ember", root="/r", mode="auto",
+                                    effort="high", session_id="s1",
+                                    session_path="/s/s1.json",
                                     agents=["AGENTS.md"], width=60)
         lines = banner.splitlines()
         self.assertTrue(all(len(nada._strip_ansi(l)) == 60 for l in lines))
         self.assertTrue(lines[0].startswith("╭─") and lines[0].endswith("╮"))
         self.assertTrue(lines[-1].startswith("╰─") and lines[-1].endswith("╯"))
-        for needle in ["nada · m", "/r", "auto · effort: high",
-                       "session: s1", "AGENTS.md: AGENTS.md", "/help for commands"]:
+        for needle in ["nada", "/r", "AGENTS.md: AGENTS.md", "/help for commands"]:
             self.assertIn(needle, banner)
+        # Live state is the statusline's job, not the banner's: none of it
+        # (passed above for compatibility) may be repeated here.
+        for duplicated in ["meta/muse-ember", "auto", "high", "s1"]:
+            self.assertNotIn(duplicated, banner)
+
+    def test_format_statusline(self):
+        session = type("S", (), {"id": "s1", "turns": 3})()
+        bar = nada.format_statusline(model="meta/muse-ember", root="/home/u/nada",
+                                     mode="auto", effort="high", session=session,
+                                     usage={"prompt_tokens": 1234,
+                                            "completion_tokens": 567},
+                                     width=200)
+        self.assertEqual(bar, "meta/muse-ember · nada · auto · effort: high · "
+                              "session: s1 · 3 turns · tokens: 1,234 in · 567 out")
+        self.assertNotIn("\x1b[", bar)  # plain off-tty
+        singular = nada.format_statusline(model="m", root="/r", mode="plan",
+                                          effort=None, session_id="s",
+                                          turns=1, usage={}, width=200)
+        self.assertTrue(singular.endswith("· 1 turn"))
+        self.assertIn("effort: (model default)", singular)
+        self.assertNotIn("tokens:", singular)  # no usage, no segment
+
+    def test_format_statusline_drops_low_priority_segments_when_narrow(self):
+        bar = nada.format_statusline(model="meta/muse-ember", root="/home/u/nada",
+                                     mode="auto", effort="high", session_id="s1",
+                                     turns=3, usage={"prompt_tokens": 1234,
+                                                     "completion_tokens": 567},
+                                     width=40)
+        self.assertLessEqual(len(nada._strip_ansi(bar)), 40)
+        self.assertIn("meta/muse-ember", bar)   # core segments survive
+        self.assertIn("auto", bar)
+        self.assertNotIn("tokens:", bar)        # usage dropped first
+        self.assertNotIn("session:", bar)       # ... then session
+
+    def test_format_statusline_coloured_mode_and_globals(self):
+        with patch.object(nada, "_use_color", lambda stream=None: True), \
+             patch.object(nada, "MODEL", "m2"), patch.object(nada, "EFFORT", "low"), \
+             patch.object(nada, "_LAST_USAGE", {"prompt_tokens": 1,
+                                                "completion_tokens": 2}):
+            bar = nada.format_statusline(root="/x/proj", mode="yolo", width=200)
+        self.assertIn("\x1b[", bar)
+        self.assertEqual(nada._strip_ansi(bar),
+                         "m2 · proj · yolo · effort: low · tokens: 1 in · 2 out")
+        # ANSI codes must not count towards the width.
+        with patch.object(nada, "_use_color", lambda stream=None: True):
+            narrow = nada.format_statusline(model="meta/muse-ember", root="/x/nada",
+                                            mode="auto", effort="high", width=60)
+        self.assertLessEqual(len(nada._strip_ansi(narrow)), 60)
+        self.assertIn("effort: high", nada._strip_ansi(narrow))
+
+    def test_resolve_statusline_does_not_retruncate_a_formatted_bar(self):
+        with patch.object(nada, "_use_color", lambda stream=None: True):
+            bar = nada.format_statusline(model="meta/muse-ember", root="/x/nada",
+                                         mode="auto", effort="high",
+                                         session_id="s1", turns=2, width=200)
+        resolved = nada._resolve_statusline(lambda: bar, perms("auto"))
+        self.assertEqual(resolved, bar)  # colour + length preserved
+        self.assertEqual(nada._resolve_statusline("a\nb", perms()), "a b")
+
+    def test_read_line_raw_draws_statusline_under_prompt_on_tty(self):
+        p = perms("default")
+        out = self._Tty()
+        with patch.dict(os.environ, {"TERM": "xterm"}):
+            line = nada._read_line_raw(p, io.BytesIO(b"hi\r"), out,
+                                       statusline="STATUSBAR")
+        self.assertEqual(line, "hi")
+        self.assertIn("STATUSBAR", out.getvalue())
+        self.assertNotIn("[default]", out.getvalue())  # mode only in the bar
+        self.assertIn("\x1b[1A", out.getvalue())     # cursor back up to prompt
+        self.assertIn("\r\n\x1b[K", out.getvalue())  # submit clears the bar line
+
+    def test_read_line_raw_no_statusline_off_tty(self):
+        p = perms("default")
+        out = io.StringIO()
+        line = nada._read_line_raw(p, io.BytesIO(b"hi\r"), out,
+                                   statusline="STATUSBAR")
+        self.assertEqual(line, "hi")
+        self.assertNotIn("STATUSBAR", out.getvalue())
+        self.assertNotIn("\x1b[1A", out.getvalue())
+        # No bar to carry the mode, so the prompt falls back to `[mode] > `.
+        self.assertIn("[default] > ", out.getvalue())
+
+    def test_read_repl_line_fallback_prompt_carries_mode_only_without_bar(self):
+        p = perms("plan")
+        prompts, printed = [], []
+        with patch.object(nada, "_is_tty", lambda: False), \
+             patch.object(nada, "termios", None), \
+             patch.object(nada, "_statusline_enabled", lambda stream=None: False), \
+             patch("builtins.input", lambda prompt="": prompts.append(prompt) or "task"):
+            self.assertEqual(nada.read_repl_line(p, statusline="STATUSBAR"), "task")
+        self.assertEqual(prompts, ["[plan] > "])  # no bar: mode in the prompt
+        self.assertEqual(printed, [])
+        prompts.clear()
+        with patch.object(nada, "_is_tty", lambda: False), \
+             patch.object(nada, "termios", None), \
+             patch.object(nada, "_statusline_enabled", lambda stream=None: True), \
+             patch("builtins.print", lambda *a, **k: printed.append(a[0])), \
+             patch("builtins.input", lambda prompt="": prompts.append(prompt) or "task"):
+            self.assertEqual(nada.read_repl_line(p, statusline="STATUSBAR"), "task")
+        self.assertEqual(prompts, ["> "])          # bar above: bare prompt
+        self.assertEqual(printed, ["STATUSBAR"])
+
+    def test_read_line_raw_statusline_refreshes_on_mode_cycle(self):
+        p = perms("default")
+        out = self._Tty()
+        with patch.dict(os.environ, {"TERM": "xterm"}):
+            line = nada._read_line_raw(
+                p, io.BytesIO(b"\x1b[27;5;9~x\r"), out,
+                statusline=lambda: f"mode={p.mode}")
+        self.assertEqual((line, p.mode), ("x", "accept-edits"))
+        self.assertIn("mode=accept-edits", out.getvalue())
 
     def test_format_usage(self):
         self.assertEqual(nada.format_usage({"prompt_tokens": 1234,
@@ -994,6 +1113,8 @@ class TestTerminalUI(unittest.TestCase):
         self.assertIn("✓ Ran make build", out)
         self.assertIn("8 more lines", out)
         self.assertIn("tokens: 10 in · 5 out", out)
+        self.assertEqual(nada._LAST_USAGE,
+                         {"prompt_tokens": 10, "completion_tokens": 5})
         self.assertIn("done", out)
         self.assertNotIn('{"command"', out)  # no raw argument dump
 
