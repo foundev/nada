@@ -251,6 +251,133 @@ class TestModeSwitchKeys(unittest.TestCase):
             nada._read_line_raw(p, io.BytesIO(b"\x04"), io.StringIO())
 
 
+class TestReviewContextV1(unittest.TestCase):
+    """Auto-review v1: full conversation + retained user requests, exact
+    action, score-derived verdicts, denial resample, rationale surfacing."""
+
+    def test_user_requests_always_retained(self):
+        # The original task must survive no matter how many tool results
+        # follow it (the issue #1 failure: last-6 + head-truncation lost it).
+        messages = [{"role": "system", "content": "scaffold"},
+                    {"role": "user", "content": "add AGENTS.md support"}]
+        for i in range(20):
+            messages += [{"role": "assistant", "content": "reading"},
+                         {"role": "tool", "tool_call_id": str(i), "content": "y" * 2000}]
+        messages.append({"role": "assistant", "content": "",
+                         "tool_calls": [{"id": "9", "function": {"name": "bash",
+                                            "arguments": '{"command":"make build"}'}}]})
+        self.assertEqual(nada.collect_user_requests(messages), ["add AGENTS.md support"])
+        ctx = nada.build_review_context(messages)
+        self.assertIn("add AGENTS.md support", ctx)          # task retained
+        self.assertIn("make build", ctx)                      # tail not cut
+        self.assertNotIn("scaffold", ctx.split("CONVERSATION")[1])  # system excluded
+
+    def test_build_review_context_string_passthrough(self):
+        self.assertEqual(nada.build_review_context("plain"), "plain")
+        self.assertEqual(nada.build_review_context(None), "")
+
+    def test_action_json_is_untruncated(self):
+        args = {"path": "nada.py", "old_string": "a", "new_string": "x" * 5000 + "TAIL"}
+        self.assertIn("TAIL", nada._action_json("edit_file", args))
+
+    def test_parse_verdict_whitespace_and_scores(self):
+        self.assertTrue(nada._parse_review_verdict('{"decision":" approve ","rationale":"x"}')[0])
+        # No decision: derived from Codex thresholds.
+        self.assertTrue(nada._parse_review_verdict(
+            '{"risk_level":"low","user_authorization":"unknown","rationale":"r"}')[0])
+        self.assertTrue(nada._parse_review_verdict(
+            '{"risk_level":"high","user_authorization":"high","rationale":"r"}')[0])
+        self.assertFalse(nada._parse_review_verdict(
+            '{"risk_level":"high","user_authorization":"unknown","rationale":"r"}')[0])
+        self.assertFalse(nada._parse_review_verdict(
+            '{"risk_level":"critical","user_authorization":"high","rationale":"r"}')[0])
+        # Provider content as a list of parts.
+        self.assertTrue(nada._parse_review_verdict(
+            [{"text": '{"decision":"approve","rationale":"ok"}'}])[0])
+
+    def _review(self, replies, name="edit_file", args=None, context=None):
+        """review_action with call_model replaying `replies` (dicts or
+        exceptions); returns (verdict, sent_messages)."""
+        sent, remaining = [], iter(replies)
+
+        def fake_call_model(messages, **kw):
+            sent.append(messages)
+            outcome = next(remaining)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        with patch.object(nada, "call_model", fake_call_model):
+            return nada.review_action(name, args or {"path": "x"}, context), sent
+
+    @staticmethod
+    def _reply(content):
+        return {"choices": [{"message": {"content": content}}]}
+
+    def test_review_action_sends_full_action_and_context(self):
+        big = {"path": "x", "content": "z" * 3000 + "TAIL"}
+        messages = [{"role": "user", "content": "do the thing"},
+                    {"role": "assistant", "content": "working"}]
+        (approved, _), sent = self._review(
+            [self._reply('{"decision":"approve","rationale":"fine"}')],
+            name="write_file", args=big, context=messages)
+        self.assertTrue(approved)
+        user_msg = sent[0][1]["content"]
+        self.assertIn("TAIL", user_msg)             # exact action, untruncated
+        self.assertIn("do the thing", user_msg)     # user request retained
+        # Stable context precedes the action, so the whole context is a
+        # cacheable prefix across successive reviews in a session.
+        self.assertLess(user_msg.index("do the thing"), user_msg.index("TAIL"))
+
+    def test_review_action_resamples_a_denial_once(self):
+        deny = self._reply('{"decision":"deny","rationale":"unsure"}')
+        allow = self._reply('{"decision":"approve","rationale":"fine on resample"}')
+        (approved, rationale), sent = self._review([deny, allow])
+        self.assertTrue(approved)
+        self.assertEqual(len(sent), 2)
+
+    def test_review_action_failed_resample_keeps_first_denial(self):
+        deny = self._reply('{"decision":"deny","rationale":"first"}')
+        (approved, rationale), _ = self._review([deny, RuntimeError("boom")])
+        self.assertFalse(approved)
+        self.assertEqual(rationale, "first")
+
+    def test_review_action_retries_reviewer_error_once(self):
+        allow = self._reply('{"decision":"approve","rationale":"ok"}')
+        (approved, _), _ = self._review([RuntimeError("flake"), allow])
+        self.assertTrue(approved)
+        with self.assertRaises(RuntimeError):
+            self._review([RuntimeError("x"), RuntimeError("y")])
+
+    def test_review_action_tolerates_list_content_and_empty_choices(self):
+        (approved, _), _ = self._review(
+            [self._reply([{"text": '{"decision":"approve","rationale":"ok"}'}])])
+        self.assertTrue(approved)
+        (approved, _), _ = self._review([{"choices": []}, {"choices": []}])
+        self.assertFalse(approved)  # no verdict -> deny (fail closed)
+
+    def test_call_model_json_mode(self):
+        bodies = []
+
+        class _Response:
+            def __init__(self, payload):
+                self._buf = io.BytesIO(json.dumps(payload).encode())
+            def __enter__(self):
+                return self._buf
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            bodies.append(json.loads(req.data))
+            return _Response({"ok": True})
+
+        with patch.object(nada.urllib.request, "urlopen", fake_urlopen):
+            nada.call_model([{"role": "user", "content": "hi"}], json_mode=True)
+            nada.call_model([{"role": "user", "content": "hi"}])
+        self.assertEqual(bodies[0]["response_format"], {"type": "json_object"})
+        self.assertNotIn("response_format", bodies[1])
+
+
 class TestRunTurns(unittest.TestCase):
     def _run(self, tool_args, p):
         calls = []
@@ -275,6 +402,24 @@ class TestRunTurns(unittest.TestCase):
         calls, messages = self._run('{"command": "rm -rf build"}', perms("ask", ["y"]))
         self.assertEqual(calls, [{"command": "rm -rf build"}])
         self.assertEqual(messages[-2]["content"], "ran")
+
+    def test_auto_denial_rationale_reaches_the_model(self):
+        # Issue #1: the agent must see WHY it was denied, not a bare
+        # PermissionDenied it cannot act on.
+        def reviewer(name, args, context=None):
+            return (False, "would weaken security boundaries")
+        calls, messages = self._run('{"command": "rm -rf build"}',
+                                    perms("auto", reviewer=reviewer))
+        self.assertEqual(calls, [])
+        self.assertIn("would weaken security boundaries", messages[-2]["content"])
+
+    def test_auto_reviewer_error_is_distinguishable(self):
+        def reviewer(name, args, context=None):
+            raise RuntimeError("model gone")
+        calls, messages = self._run('{"command": "make build"}',
+                                    perms("auto", reviewer=reviewer))
+        self.assertEqual(calls, [])
+        self.assertIn("auto-reviewer unavailable: model gone", messages[-2]["content"])
 
 
 class TestCallModelRetries(unittest.TestCase):

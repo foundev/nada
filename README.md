@@ -73,12 +73,21 @@ Like Codex's `approvals_reviewer = "auto_review"` / "Approve for me": every
 *eligible* gated action — i.e. one that would otherwise prompt you — is sent
 to a separate reviewer model instead of to you. Actions already allowed
 (`read_file`, provably read-only `bash`, session allowlist) run without
-review. The reviewer sees the exact action plus recent conversation context
-and must reply `{"decision": "approve"|"deny", "rationale": ...}` under a
-guardian policy: deny exfiltration, credential probing, persistent security
-weakening, and destructive/irreversible actions; approve ordinary reversible
-in-workspace work. Reviewer errors and unparsable verdicts **fail closed**
-(deny). This costs one extra model call per gated action.
+review. The reviewer sees the **exact action, untruncated**, plus the **full
+conversation back-and-forth, untruncated**, in labelled sections: every user
+request is always retained verbatim as the (only) trusted source of
+authorization, while assistant/tool content is untrusted evidence. It scores
+`risk_level` and `user_authorization` and derives the decision by thresholds
+(low/medium risk → approve; high → approve only with at least medium user
+authorization; critical → deny), denying exfiltration, credential probing,
+persistent security weakening, and destructive/irreversible actions under any
+score. A user re-approval of a previously denied action counts as high
+authorization. The verdict is requested as strict JSON. A first denial is
+**resampled once** before it stands, and a reviewer error is retried once;
+anything still failing **fails closed** (deny). The denial reason (or
+reviewer error) is included in the `PermissionDenied` result the model
+receives, so it can adapt. This costs one extra model call per gated action
+(two if the first verdict is a denial or errors).
 
 The reviewer uses `AGENT_REVIEW_MODEL` (default `openai/gpt-6-luna`); e.g.
 `AGENT_REVIEW_MODEL=openai/gpt-5.6-luna` to override it, if available on
