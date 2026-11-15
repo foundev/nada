@@ -123,12 +123,80 @@ def _effort_summary(info):
             avail += f" (model default: {info['default_effort']})"
     return f"Effort: {current} for {MODEL} (available: {avail})"
 
-SYSTEM = f"""You are a coding agent in {ROOT}.
+# --- AGENTS.md (https://agents.md) -----------------------------------------
+# Spec, and nothing beyond it:
+#   * The file is named exactly `AGENTS.md` and is plain Markdown -- no
+#     required fields, headings, or frontmatter; its text is used verbatim.
+#   * It lives at the root of the repository, and a nested `AGENTS.md` may
+#     be placed inside each subproject/subdirectory.
+#   * Where instructions conflict, the closest AGENTS.md to the file being
+#     edited wins; explicit user instructions in the chat override AGENTS.md.
+# Nada therefore loads the root file and every nested file under ROOT into
+# the system prompt, ordered from the repository root to the deepest nested
+# file (each labelled with its path), so the model can apply that
+# closest-wins rule per edited file. No other file name or location (no
+# global/home file, no CLAUDE.md/AGENT.md fallback, ...) is consulted.
+
+AGENTS_FILENAME = "AGENTS.md"
+
+def find_agents_files(root=None):
+    """Every `AGENTS.md` under `root`: the root file first, then nested
+    files shallow-to-deep (parents before their descendants, ties broken
+    by path, so the result is deterministic). Only files named exactly
+    `AGENTS.md` count."""
+    root_path = Path(root if root is not None else ROOT).resolve()
+    if not root_path.is_dir():
+        return []
+    files = [p for p in root_path.rglob(AGENTS_FILENAME) if p.is_file()]
+    def _key(p):
+        rel = p.relative_to(root_path)
+        return (len(rel.parts), rel.as_posix())
+    return sorted(files, key=_key)
+
+def load_agents_instructions(root=None):
+    """[(path relative to root, verbatim text)] for find_agents_files(),
+    in the same order. An unreadable file is skipped with a warning."""
+    root_path = Path(root if root is not None else ROOT).resolve()
+    out = []
+    for p in find_agents_files(root_path):
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            print(f"Warning: could not read {p.relative_to(root_path)}: {e}",
+                  file=sys.stderr)
+            continue
+        out.append((p.relative_to(root_path).as_posix(), text))
+    return out
+
+def build_system_prompt(root=None):
+    """The base system prompt plus, if any exist, the AGENTS.md
+    instructions for `root` (see above). Rebuilt wherever a fresh system
+    prompt is needed, so edits to an AGENTS.md (living documentation, per
+    the spec) are picked up by new/restored/cleared sessions."""
+    root_path = Path(root if root is not None else ROOT).resolve()
+    prompt = f"""You are a coding agent in {root_path}.
 Explore with bash: `rg -n PATTERN .` (or `grep -rn PATTERN .`), `find . -name '*.py'`, `ls -R`
 Read files with read_file before editing.
 Edit only with edit_file (old_string must match exactly, no line numbers), create files with write_file.
 Do not use sed/echo/cat to edit. Verify changes by running tests with bash. Be concise.
 Tool calls may be denied by permission prompts; if a call is denied, do not retry it unchanged — say so and ask the user or propose an alternative."""
+    agents = load_agents_instructions(root_path)
+    if not agents:
+        return prompt
+    intro = ("Instructions from AGENTS.md files in this repository follow. AGENTS.md is "
+             "plain Markdown with no required fields, included verbatim below. Where "
+             "AGENTS.md instructions conflict, the closest AGENTS.md to the file being "
+             "edited wins; explicit user instructions in the chat override AGENTS.md. "
+             "Files are ordered from the repository root to the deepest nested file "
+             "(each labelled with its path), so a nested file appears after, and takes "
+             "precedence over, its parents for the files under it.")
+    blocks = [intro] + [f"--- AGENTS.md: {rel} ---\n{text.rstrip()}"
+                         for rel, text in agents]
+    return prompt + "\n\n" + "\n\n".join(blocks)
+
+# Import-time snapshot of the built prompt (kept for compatibility; live
+# sessions rebuild it via build_system_prompt()).
+SYSTEM = build_system_prompt()
 
 def tool(name, description, properties, required):
     return {"type": "function", "function": {
@@ -998,7 +1066,7 @@ class Session:
         self.title = title
         self.created_at = self.updated_at = _utcnow()
         self.root, self.model = str(ROOT), MODEL
-        self.messages = messages if messages is not None else [{"role": "system", "content": SYSTEM}]
+        self.messages = messages if messages is not None else [{"role": "system", "content": build_system_prompt()}]
         self.history = history if history is not None else []
         self.autosave = True
 
@@ -1050,9 +1118,9 @@ class Session:
         self.root, self.model = data.get("root") or str(ROOT), data.get("model") or MODEL
         messages = [dict(m) for m in data["messages"]]
         if messages and messages[0].get("role") == "system":
-            messages[0] = {"role": "system", "content": SYSTEM}
+            messages[0] = {"role": "system", "content": build_system_prompt()}
         else:
-            messages.insert(0, {"role": "system", "content": SYSTEM})
+            messages.insert(0, {"role": "system", "content": build_system_prompt()})
         self.messages[:] = _trim_incomplete_tool_calls(messages)
         self.history[:] = list(data.get("history") or [])
         # Permission mode/allowlist are recorded in the file but deliberately
@@ -1073,7 +1141,7 @@ class Session:
         """Start a new, empty session (new id, fresh history)."""
         self.id, self.title = _new_session_id(), None
         self.created_at = self.updated_at = _utcnow()
-        self.messages[:] = [{"role": "system", "content": SYSTEM}]
+        self.messages[:] = [{"role": "system", "content": build_system_prompt()}]
         self.history[:] = []
 
 def handle_session_command(parts, session):
@@ -1197,6 +1265,9 @@ def main():
             session.try_save()
         return
     print(f"Model: {MODEL}\n{_effort_summary(_reasoning)}\nRoot: {ROOT}\nPermissions: {PERMS.mode} ({PERMS.describe()})")
+    _agents = load_agents_instructions()
+    if _agents:
+        print("AGENTS.md: " + ", ".join(rel for rel, _ in _agents))
     print(f"Session: {session.id} ({session.path()})")
     print("/quit to exit, /clear to reset, /mode [default|accept-edits|plan|auto|yolo] to switch modes, "
           "/effort [LEVEL|clear] to set model effort, "
@@ -1209,7 +1280,7 @@ def main():
             print()
             break
         if task in {"/quit", "/exit"}: break
-        if task == "/clear": session.messages[:] = [{"role": "system", "content": SYSTEM}]; continue
+        if task == "/clear": session.messages[:] = [{"role": "system", "content": build_system_prompt()}]; continue
         if task.split() and task.split()[0] in {"/permissions", "/mode"}:
             handle_permissions_command(task.split()); continue
         if task.split() and task.split()[0] == "/effort":

@@ -17,6 +17,26 @@ REPL commands: `/quit`, `/clear`, `/mode [MODE]`, `/permissions [MODE|clear]`,
 `/effort [LEVEL|clear]`, `/session [save [TITLE]|list|resume ID|new|delete ID|path]`
 (aliases: `/sessions`, `/resume ID`).
 
+## AGENTS.md
+
+nada follows the [AGENTS.md](https://agents.md) spec, and nothing beyond it:
+`AGENTS.md` is plain Markdown with no required fields/headings/frontmatter,
+and its text is included verbatim in the system prompt.
+
+- Place `AGENTS.md` at the root of the repository (nada's working
+  directory). The exact filename is `AGENTS.md` — no other name or location
+  (e.g. no global/home file, no `AGENT.md`/`CLAUDE.md` fallback) is consulted.
+- For a large monorepo, place a nested `AGENTS.md` inside each
+  subproject/subdirectory. nada loads the root file and every nested file
+  under the root, ordered from the root to the deepest nested file, each
+  labelled with its path (at startup the loaded files are listed).
+- Precedence, per the spec: where `AGENTS.md` instructions conflict, the
+  closest `AGENTS.md` to the file being edited wins; explicit user
+  instructions in the chat override `AGENTS.md`.
+- The system prompt is rebuilt for new/restored/cleared sessions, so
+  editing an `AGENTS.md` (living documentation) is picked up on the next
+  such session. An unreadable `AGENTS.md` is skipped with a warning.
+
 ## Permissions
 
 Mutating and shell tools are gated by permission prompts. `read_file` and

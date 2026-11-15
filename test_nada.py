@@ -658,5 +658,79 @@ class TestParseArgs(unittest.TestCase):
         self.assertEqual(a.effort, "low")
 
 
+class TestAgentsMd(unittest.TestCase):
+    """AGENTS.md per https://agents.md: root + nested, exact filename,
+    plain Markdown, closest to the edited file wins, user chat overrides."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        from pathlib import Path
+        self.root = Path(self._tmp.name)
+
+    def _write(self, rel, text):
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_root_and_nested_ordering(self):
+        self._write("AGENTS.md", "# root\n")
+        self._write("pkg/AGENTS.md", "# pkg\n")
+        self._write("pkg/sub/AGENTS.md", "# sub\n")
+        self._write("other/AGENTS.md", "# other\n")
+        found = [p.relative_to(self.root).as_posix()
+                 for p in nada.find_agents_files(self.root)]
+        # Root first, then shallow-to-deep (parents before descendants).
+        self.assertEqual(found, ["AGENTS.md", "other/AGENTS.md",
+                                 "pkg/AGENTS.md", "pkg/sub/AGENTS.md"])
+        loaded = nada.load_agents_instructions(self.root)
+        self.assertEqual([rel for rel, _ in loaded], found)
+        self.assertEqual(loaded[0][1], "# root\n")
+
+    def test_only_exact_agents_md_filename(self):
+        self._write("AGENTS.md", "# root\n")
+        for name in ["AGENT.md", "agents.md", "CLAUDE.md", "AGENTS.md.bak", "xAGENTS.md"]:
+            self._write(name, "# not the spec filename\n")
+            self._write(f"sub/{name}", "# not the spec filename\n")
+        (self.root / "dir/AGENTS.md").mkdir(parents=True)  # a directory, not a file
+        found = [p.relative_to(self.root).as_posix()
+                 for p in nada.find_agents_files(self.root)]
+        self.assertEqual(found, ["AGENTS.md"])
+
+    def test_no_agents_md_leaves_prompt_unchanged(self):
+        self.assertEqual(nada.find_agents_files(self.root), [])
+        self.assertEqual(nada.load_agents_instructions(self.root), [])
+        prompt = nada.build_system_prompt(self.root)
+        self.assertNotIn("AGENTS.md files in this repository follow", prompt)
+        self.assertIn("You are a coding agent", prompt)
+
+    def test_build_includes_verbatim_labelled_and_precedence(self):
+        self._write("AGENTS.md", "# root\nrun `make root`\n")
+        self._write("pkg/AGENTS.md", "# pkg\nrun `make pkg`\n")
+        prompt = nada.build_system_prompt(self.root)
+        self.assertIn("--- AGENTS.md: AGENTS.md ---\n# root\nrun `make root`", prompt)
+        self.assertIn("--- AGENTS.md: pkg/AGENTS.md ---\n# pkg\nrun `make pkg`", prompt)
+        # Nested (closest) appears after its parent.
+        self.assertLess(prompt.index("run `make root`"), prompt.index("run `make pkg`"))
+        # Spec precedence rule, verbatim in substance.
+        self.assertIn("closest AGENTS.md to the file being edited wins", prompt)
+        self.assertIn("explicit user instructions in the chat override AGENTS.md", prompt)
+
+    def test_session_system_prompt_uses_agents_and_regenerates(self):
+        self._write("AGENTS.md", "# root instructions\n")
+        self._write("pkg/AGENTS.md", "# nested instructions\n")
+        store = nada.SessionStore(str(self.root / "sessions"))
+        with patch.object(nada, "ROOT", self.root):
+            session = nada.Session(store)
+            self.assertIn("# root instructions", session.messages[0]["content"])
+            self.assertIn("# nested instructions", session.messages[0]["content"])
+            # Living documentation: a later edit is picked up on reset.
+            self._write("AGENTS.md", "# updated root\n")
+            session.reset()
+            self.assertIn("# updated root", session.messages[0]["content"])
+            self.assertNotIn("# root instructions", session.messages[0]["content"])
+
+
 if __name__ == "__main__":
     unittest.main()
