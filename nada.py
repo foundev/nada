@@ -24,6 +24,9 @@ RETRY_BACKOFF = float(os.environ.get("AGENT_RETRY_BACKOFF", "2"))         # mult
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Per-model metadata (singular "model"): reasoning.supported_efforts etc.
 MODEL_INFO_URL = "https://openrouter.ai/api/v1/model"
+LLAMA_APP_URL = os.environ.get("LLAMA_APP_URL", "http://127.0.0.1:9931").rstrip("/")
+LLAMA_APP_API_KEY = os.environ.get("LLAMA_APP_API_KEY", "")
+USING_LLAMA_APP = False
 BASH = "/bin/bash" if Path("/bin/bash").exists() else None
 
 # --- Model effort level (reasoning effort) ----------------------------------
@@ -49,6 +52,30 @@ def normalize_effort(effort):
 EFFORT = normalize_effort(os.environ.get("AGENT_EFFORT") or os.environ.get("MODEL_EFFORT")
                           or os.environ.get("REASONING_EFFORT") or os.environ.get("EFFORT"))
 _MODEL_REASONING_CACHE = {}  # model id -> parse_model_reasoning() dict
+
+def detect_llama_app(timeout=0.25):
+    """Return model ids from a local llama.app server, or [] if unavailable.
+
+    llama.app serves OpenAI-compatible model metadata at /v1/models. This
+    deliberately fails silently: local serving is optional and OpenRouter is
+    still the normal fallback.
+    """
+    headers = {"Authorization": f"Bearer {LLAMA_APP_API_KEY}"} if LLAMA_APP_API_KEY else {}
+    request = urllib.request.Request(f"{LLAMA_APP_URL}/v1/models", headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.load(response)
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError, ValueError, json.JSONDecodeError):
+        return []
+    models = data.get("data", []) if isinstance(data, dict) else []
+    return [item["id"].strip() for item in models
+            if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()]
+
+def activate_llama_app():
+    """Route completions to the detected local llama.app server."""
+    global API_URL, USING_LLAMA_APP
+    API_URL = f"{LLAMA_APP_URL}/v1/chat/completions"
+    USING_LLAMA_APP = True
 
 def validate_effort(effort, supported=None):
     """Normalized effort (or None), raising ValueError if it is not a real
@@ -107,6 +134,10 @@ def fetch_model_reasoning(model=None, *, timeout=15):
     """Reasoning info for `model` (default MODEL), discovered live from
     GET /api/v1/model/{model} and cached per model id. Raises on HTTP /
     network errors so callers can fail soft. No API key needed."""
+    if USING_LLAMA_APP:
+        # llama.app accepts OpenAI chat completions but does not expose
+        # OpenRouter's effort metadata or request contract.
+        return parse_model_reasoning({})
     model = model or MODEL
     if model in _MODEL_REASONING_CACHE:
         return _MODEL_REASONING_CACHE[model]
@@ -157,10 +188,15 @@ def find_agents_files(root=None):
     files shallow-to-deep (parents before their descendants, ties broken
     by path, so the result is deterministic). Only files named exactly
     `AGENTS.md` count."""
-    root_path = Path(root if root is not None else ROOT).resolve()
+    root_path = Path(root if root is not None else ROOT)
+    if not root_path.is_absolute():
+        root_path = Path.cwd() / root_path
     if not root_path.is_dir():
         return []
-    files = [p for p in root_path.rglob(AGENTS_FILENAME) if p.is_file()]
+    # Filesystems such as default macOS volumes may match glob patterns
+    # case-insensitively, so enforce the spec's exact filename ourselves.
+    files = [p for p in root_path.rglob("*")
+             if p.is_file() and p.name == AGENTS_FILENAME]
     def _key(p):
         rel = p.relative_to(root_path)
         return (len(rel.parts), rel.as_posix())
@@ -169,7 +205,9 @@ def find_agents_files(root=None):
 def load_agents_instructions(root=None):
     """[(path relative to root, verbatim text)] for find_agents_files(),
     in the same order. An unreadable file is skipped with a warning."""
-    root_path = Path(root if root is not None else ROOT).resolve()
+    root_path = Path(root if root is not None else ROOT)
+    if not root_path.is_absolute():
+        root_path = Path.cwd() / root_path
     out = []
     for p in find_agents_files(root_path):
         try:
@@ -186,7 +224,9 @@ def build_system_prompt(root=None):
     instructions for `root` (see above). Rebuilt wherever a fresh system
     prompt is needed, so edits to an AGENTS.md (living documentation, per
     the spec) are picked up by new/restored/cleared sessions."""
-    root_path = Path(root if root is not None else ROOT).resolve()
+    root_path = Path(root if root is not None else ROOT)
+    if not root_path.is_absolute():
+        root_path = Path.cwd() / root_path
     prompt = f"""You are a coding agent in {root_path}.
 Explore with bash: `rg -n PATTERN .` (or `grep -rn PATTERN .`), `find . -name '*.py'`, `ls -R`
 Read files with read_file before editing.
@@ -1368,16 +1408,20 @@ def call_model(messages, model=None, use_tools=True, *, max_retries=None, sleep_
         body = {"model": model or MODEL, "messages": messages}
         # Effort applies to the main model only: a different reviewer model
         # uses its own default rather than risking an unsupported level.
-        if EFFORT and body["model"] == MODEL:
+        if EFFORT and body["model"] == MODEL and not USING_LLAMA_APP:
             body["reasoning"] = {"effort": EFFORT}
         if use_tools:
             body.update({"tools": TOOLS, "tool_choice": "auto"})
         if json_mode:
             body["response_format"] = {"type": "json_object"}
         payload = json.dumps(body).encode()
-        req = urllib.request.Request(API_URL, data=payload, method="POST", headers={
-            "Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json",
-            "X-Title": "stdlib-agent"})
+        headers = {"Content-Type": "application/json", "X-Title": "stdlib-agent"}
+        if USING_LLAMA_APP:
+            if LLAMA_APP_API_KEY:
+                headers["Authorization"] = f"Bearer {LLAMA_APP_API_KEY}"
+        else:
+            headers["Authorization"] = f"Bearer {API_KEY}"
+        req = urllib.request.Request(API_URL, data=payload, method="POST", headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=180) as r:
                 return json.load(r)
@@ -1385,11 +1429,13 @@ def call_model(messages, model=None, use_tools=True, *, max_retries=None, sleep_
             detail = e.read().decode(errors="replace")
             e.close()  # release the connection before sleeping / retrying
             if e.code != 429 or attempt == retries:
-                raise RuntimeError(f"OpenRouter {e.code}: {detail}") from e
+                provider = "llama.app" if USING_LLAMA_APP else "OpenRouter"
+                raise RuntimeError(f"{provider} {e.code}: {detail}") from e
             headers = getattr(e, "headers", None)
             delay = _backoff_delay(attempt, _parse_retry_after(
                 headers.get("Retry-After") if headers else None))
-            print(f"{_yellow('⏳', stream=sys.stderr)} [rate-limit] OpenRouter 429; retrying in {delay:.1f}s "
+            provider = "llama.app" if USING_LLAMA_APP else "OpenRouter"
+            print(f"{_yellow('⏳', stream=sys.stderr)} [rate-limit] {provider} 429; retrying in {delay:.1f}s "
                   f"({attempt + 1}/{retries})", file=sys.stderr)
             sleep_fn(delay)
 
@@ -1455,7 +1501,8 @@ def review_action(name, args, context=None):
     first_denial, last_err = None, None
     for _ in range(2):
         try:
-            reply = call_model(messages, model=REVIEW_MODEL, use_tools=False, json_mode=True)
+            reply = call_model(messages, model=MODEL if USING_LLAMA_APP else REVIEW_MODEL,
+                               use_tools=False, json_mode=True)
         except Exception as e:
             last_err = e
             continue
@@ -2196,6 +2243,11 @@ def handle_session_command(parts, session):
         print(_SESSION_USAGE)
 
 def main():
+    global API_URL, USING_LLAMA_APP
+    # main() is normally called only once, but reset this state so embedders
+    # and tests that invoke it repeatedly get a fresh detection each time.
+    API_URL = "https://openrouter.ai/api/v1/chat/completions"
+    USING_LLAMA_APP = False
     args = parse_args()
     if args.no_color:
         os.environ["NO_COLOR"] = "1"
@@ -2221,14 +2273,23 @@ def main():
     saved_settings = load_settings()
     _mode, _mode_source = resolve_permission_mode(_cli_mode, saved_settings)
     PERMS.set_mode(_mode)
+    llama_models = detect_llama_app()
+    if llama_models:
+        activate_llama_app()
+        print(f"✓ Detected llama.app: {LLAMA_APP_URL} ({llama_models[0]})")
     try:
         _model, _effort, _model_source, _effort_source = resolve_selection(
             args.model, args.effort, saved_settings)
+        # A running local server is the automatic, zero-config path. An
+        # explicit CLI or environment model remains an intentional override.
+        if llama_models and args.model is None and not os.environ.get("MODEL", "").strip():
+            _model, _model_source = llama_models[0], "llama.app"
         set_model(_model)
         set_effort(_effort)
     except ValueError as e:
         sys.exit(f"error: {e}")
-    if not API_KEY: sys.exit("set OPENROUTER_API_KEY (and optionally MODEL)")
+    if not USING_LLAMA_APP and not API_KEY:
+        sys.exit("set OPENROUTER_API_KEY (or start llama.app locally)")
     store = SessionStore(args.session_dir)
     session = Session(store)
     session.autosave = not args.no_autosave
