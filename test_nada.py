@@ -786,6 +786,40 @@ class TestModelEffort(unittest.TestCase):
         self.assertNotIn("reasoning", bodies[1])                            # other (reviewer) model
         self.assertNotIn("reasoning", bodies[2])                            # unset = model default
 
+    def test_detect_llama_app_and_use_its_openai_endpoint(self):
+        seen, bodies = [], []
+
+        class _Response:
+            def __init__(self, payload):
+                self._buf = io.BytesIO(json.dumps(payload).encode())
+            def __enter__(self):
+                return self._buf
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(req)
+            if req.full_url.endswith("/v1/models"):
+                return _Response({"data": [{"id": "local-coder"}]})
+            bodies.append(json.loads(req.data))
+            return _Response({"ok": True})
+
+        with patch.object(nada.urllib.request, "urlopen", fake_urlopen), \
+             patch.object(nada, "LLAMA_APP_URL", "http://127.0.0.1:9931"), \
+             patch.object(nada, "LLAMA_APP_API_KEY", ""), \
+             patch.object(nada, "USING_LLAMA_APP", False), \
+             patch.object(nada, "API_URL", "https://openrouter.ai/api/v1/chat/completions"):
+            self.assertEqual(nada.detect_llama_app(), ["local-coder"])
+            nada.activate_llama_app()
+            nada.call_model([{"role": "user", "content": "hi"}])
+            self.assertEqual(nada.API_URL, "http://127.0.0.1:9931/v1/chat/completions")
+            self.assertNotIn("Authorization", seen[-1].headers)
+        self.assertEqual(bodies[0]["model"], nada.MODEL)
+
+    def test_detect_llama_app_falls_back_on_connection_error(self):
+        with patch.object(nada.urllib.request, "urlopen", side_effect=urllib.error.URLError("offline")):
+            self.assertEqual(nada.detect_llama_app(), [])
+
     def test_effort_command(self):
         out = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp:
@@ -973,6 +1007,23 @@ class TestPersistentSettings(unittest.TestCase):
                 nada.main()  # must not exit: a remembered effort is fail-soft
             self.assertEqual((nada.MODEL, nada.EFFORT), ("saved/model", None))
             self.assertIsNone(nada.load_settings(settings)["effort"])  # drop remembered
+
+    def test_main_uses_detected_llama_app_without_openrouter_key(self):
+        seen = []
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {k: v for k, v in os.environ.items()
+                   if k not in {"MODEL", *nada._EFFORT_ENV_VARS}}
+            env["NADA_SETTINGS_FILE"] = os.path.join(tmp, "settings.json")
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(nada, "API_KEY", ""), \
+                 patch.object(nada, "MODEL", "meta/muse-ember"), \
+                 patch.object(nada, "EFFORT", None), \
+                 patch.object(nada, "detect_llama_app", lambda: ["local-coder"]), \
+                 patch.object(nada, "run_turns", lambda messages: seen.append(
+                     (nada.MODEL, nada.API_URL, messages[-1]["content"]))), \
+                 patch("sys.argv", ["nada.py", "--session-dir", os.path.join(tmp, "sessions"), "hi"]):
+                nada.main()
+        self.assertEqual(seen, [("local-coder", "http://127.0.0.1:9931/v1/chat/completions", "hi")])
 
 
 class TestSessions(unittest.TestCase):

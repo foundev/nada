@@ -1,7 +1,7 @@
 # nada
 
 A minimal, stdlib-only coding agent (`nada.py`) driven by a model via
-OpenRouter. It exposes four tools to the model: `read_file`, `write_file`,
+OpenRouter or an automatically detected local llama.app server. It exposes four tools to the model: `read_file`, `write_file`,
 `edit_file`, and `bash`.
 
 ## Usage
@@ -12,6 +12,13 @@ python3 nada.py                       # interactive REPL
 python3 nada.py "add a README"        # one-shot task
 python3 nada.py --help
 ```
+
+If a llama.app server is running at `http://127.0.0.1:9931`, nada detects it
+via `/v1/models`, uses its first advertised model, and sends requests to its
+OpenAI-compatible `/v1/chat/completions` endpoint. No `OPENROUTER_API_KEY` is
+needed in that case. Set `MODEL` or pass `--model` to select a different
+served model; set `LLAMA_APP_URL` to use a non-default address, and
+`LLAMA_APP_API_KEY` if the server was started with `--api-key`.
 
 REPL commands: `/help`, `/status`, `/verbose [on|off]`, `/quit`, `/clear`,
 `/mode [MODE]`, `/permissions [MODE|clear]`, `/effort [LEVEL|clear]`,
@@ -205,6 +212,9 @@ reasoning, default `max`, so `none` is rejected), while `openai/gpt-5.2`
 accepts `xhigh|high|medium|low|none`. Models whose `reasoning` has no
 `supported_efforts` expose no effort selection, and setting one is rejected.
 
+When using an automatically detected llama.app server, this OpenRouter-only
+metadata is unavailable, so reasoning effort selection is disabled.
+
 A level is sent on chat completions as `"reasoning": {"effort": LEVEL}`.
 Unset (the default) sends nothing, so the model's own default applies; `none`
 (where the model offers it) disables reasoning. It applies to the main model
@@ -303,7 +313,9 @@ corrupt session files are skipped with a warning when listing.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `OPENROUTER_API_KEY` | — | required |
+| `OPENROUTER_API_KEY` | — | required unless llama.app is detected |
+| `LLAMA_APP_URL` | `http://127.0.0.1:9931` | local llama.app server address; automatically used when its `/v1/models` endpoint is available |
+| `LLAMA_APP_API_KEY` | — | optional Bearer token for a llama.app server started with `--api-key` |
 | `MODEL` | saved model, else `meta/muse-ember` | model id (`--model` overrides; see Model and effort persistence) |
 | `AGENT_REVIEW_MODEL` | `openai/gpt-6-luna` | reviewer model id for `auto` mode |
 | `AGENT_PERMISSION_MODE` | saved mode, else `default` | `default`\|`accept-edits`\|`plan`\|`auto`\|`yolo` (aliases: `ask`, `deny`, `approve-for-me`, …; CLI flags override) |
